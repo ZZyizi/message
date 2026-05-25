@@ -1,0 +1,658 @@
+<script>
+  import { onMount } from 'svelte';
+  import { invoke } from '@tauri-apps/api/core';
+  import { listen } from '@tauri-apps/api/event';
+  import { showToast } from '$lib/toast.svelte.js';
+
+  let status = $state('disconnected');
+  let relayUrl = $state('ws://localhost:8080');
+  let messages = $state([]);
+  let inputMessage = $state('');
+  let currentContact = $state(null);
+  let contacts = $state([]);
+  let isConnected = $state(false);
+  let myPubkey = $state('');
+
+  onMount(async () => {
+    // 获取我的公钥
+    try {
+      myPubkey = await invoke('get_public_key');
+    } catch (e) {
+      console.error('Failed to get pubkey:', e);
+    }
+
+    // 订阅新消息事件
+    const unlistenNewMsg = await listen('new_message', (event) => {
+      const msg = event.payload;
+      // 如果是当前聊天对象的消息，添加到列表
+      if (currentContact && (msg.from_pubkey === myPubkey || msg.from_pubkey === currentContact.pubkey || msg.to_recipient === currentContact.pubkey)) {
+        messages = [...messages, msg];
+      }
+    });
+
+    // 订阅消息撤回事件
+    const unlistenRecall = await listen('message_recalled', (event) => {
+      const eventId = event.payload;
+      messages = messages.map(m => m.event_id === eventId ? { ...m, recalled: true } : m);
+    });
+
+    return () => {
+      unlistenNewMsg();
+      unlistenRecall();
+    };
+  });
+
+  async function connect() {
+    try {
+      status = 'connecting';
+      await invoke('auto_create_identity');
+      myPubkey = await invoke('get_public_key');
+      const result = await invoke('connect', { relayUrl });
+      status = 'connected';
+      isConnected = true;
+      await loadOnlineUsers();
+    } catch (e) {
+      console.error('Failed to connect:', e);
+      showToast('连接失败: ' + (e?.message || e));
+      status = 'error';
+    }
+  }
+
+  async function loadOnlineUsers() {
+    if (!isConnected) return;
+    try {
+      const users = await invoke('get_online_users');
+      console.log('Online users:', users);
+      console.log('My pubkey:', myPubkey);
+
+      if (!users || users.length === 0) {
+        contacts = [];
+        return;
+      }
+
+      const newContacts = users.map((pubkey, index) => ({
+        id: `user_${index}`,
+        name: pubkey === myPubkey ? 'Me (' + pubkey.substring(0, 8) + '...)' : pubkey.substring(0, 8) + '...',
+        pubkey: pubkey,
+        lastMessage: '',
+        lastTime: '',
+      }));
+
+      console.log('New contacts:', newContacts);
+      contacts = [...newContacts];
+      console.log('Contacts state:', contacts);
+    } catch (e) {
+      console.error('Failed to load online users:', e);
+    }
+  }
+
+  async function disconnect() {
+    try {
+      await invoke('disconnect');
+      status = 'disconnected';
+      isConnected = false;
+    } catch (e) {
+      console.error('Failed to disconnect:', e);
+      showToast('断开连接失败: ' + (e?.message || e));
+    }
+  }
+
+  async function sendMessage() {
+    if (!inputMessage.trim() || !currentContact) return;
+
+    try {
+      const result = await invoke('send_chat_message', {
+        to: currentContact.pubkey,
+        payload: inputMessage,
+        mediaId: null,
+      });
+
+      // 立即显示发送的消息
+      const sentMsg = {
+        id: result,
+        event_id: result,
+        from_pubkey: myPubkey,
+        to_recipient: currentContact.pubkey,
+        payload: inputMessage,
+        timestamp: Date.now(),
+        delivered: false,
+        recalled: false,
+      };
+      messages = [...messages, sentMsg];
+      inputMessage = '';
+    } catch (e) {
+      console.error('Failed to send:', e);
+      showToast('发送消息失败: ' + (e?.message || e));
+    }
+  }
+
+  async function selectContact(contact) {
+    currentContact = contact;
+    await loadChat(contact.pubkey);
+  }
+
+  async function loadChat(peerPubkey) {
+    if (!peerPubkey) return;
+    try {
+      const msgs = await invoke('get_chat_messages', { peerPubkey });
+      messages = msgs || [];
+    } catch (e) {
+      console.error('Failed to load messages:', e);
+      messages = [];
+    }
+  }
+
+  function handleKeydown(e) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage();
+    }
+  }
+
+  function formatTime(timestamp) {
+    if (!timestamp) return '';
+    const d = new Date(timestamp);
+    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  }
+</script>
+
+<main>
+  <header>
+    <div class="header-left">
+      <h1>Decentralized IM</h1>
+      <span class="status-dot" class:connected={isConnected} class:connecting={status === 'connecting'}></span>
+    </div>
+    <div class="header-right">
+      <a href="/profile" class="btn-profile">个人中心</a>
+      {#if !isConnected}
+        <input
+          type="text"
+          bind:value={relayUrl}
+          placeholder="Relay URL"
+          class="relay-input"
+        />
+        <button class="btn-primary" onclick={connect}>Connect</button>
+      {:else}
+        <span class="status-text">{status}</span>
+        <button class="btn-secondary" onclick={disconnect}>Disconnect</button>
+      {/if}
+    </div>
+  </header>
+
+  <div class="container">
+    <aside class="sidebar">
+      <div class="search-box">
+        <input type="text" placeholder="Search conversations..." />
+      </div>
+      <nav class="contact-list">
+        {#if contacts.length === 0}
+          <div class="empty-contacts">No contacts online</div>
+        {/if}
+        {#each contacts as contact}
+          <button
+            class="contact-item"
+            class:active={currentContact?.id === contact.id}
+            onclick={() => selectContact(contact)}
+          >
+            <div class="avatar">
+              {contact.name[0].toUpperCase()}
+            </div>
+            <div class="contact-info">
+              <div class="contact-name">
+                {contact.name}
+                {#if contact.isGroup}
+                  <span class="group-badge">Group</span>
+                {/if}
+              </div>
+              <div class="contact-preview">{contact.lastMessage}</div>
+            </div>
+            <div class="contact-time">{contact.lastTime}</div>
+          </button>
+        {/each}
+      </nav>
+    </aside>
+
+    <section class="chat-area">
+      {#if currentContact}
+        <div class="chat-header">
+          <div class="avatar large">
+            {currentContact.name[0].toUpperCase()}
+          </div>
+          <div class="chat-header-info">
+            <div class="chat-header-name">{currentContact.name}</div>
+            <div class="chat-header-status">
+              {isConnected ? 'Online' : 'Offline'}
+            </div>
+          </div>
+        </div>
+
+        <div class="messages">
+          {#if messages.length === 0}
+            <div class="empty-messages">
+              <p>No messages yet</p>
+              <p class="hint">Send a message to start the conversation</p>
+            </div>
+          {:else}
+            {#each messages as msg}
+              <div class="message" class:sent={msg.from_pubkey === myPubkey} class:received={msg.from_pubkey !== myPubkey}>
+                <div class="message-content">
+                  <div class="message-payload">{msg.payload}</div>
+                  <div class="message-meta">
+                    <span class="message-time">{formatTime(msg.timestamp)}</span>
+                    {#if msg.from_pubkey === myPubkey && !msg.delivered}
+                      <span class="message-status">Sending...</span>
+                    {/if}
+                  </div>
+                </div>
+              </div>
+            {/each}
+          {/if}
+        </div>
+
+        <div class="chat-input-area">
+          <textarea
+            bind:value={inputMessage}
+            onkeydown={handleKeydown}
+            placeholder="Type a message..."
+            class="chat-input"
+            rows="1"
+          ></textarea>
+          <button class="btn-send" onclick={sendMessage} disabled={!inputMessage.trim()}>
+            Send
+          </button>
+        </div>
+      {:else}
+        <div class="no-chat-selected">
+          <h2>Select a conversation</h2>
+          <p>Choose a contact from the sidebar to start messaging</p>
+        </div>
+      {/if}
+    </section>
+  </div>
+</main>
+
+<style>
+  main {
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    background: #0d1117;
+  }
+
+  header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0.75rem 1.5rem;
+    background: #161b22;
+    border-bottom: 1px solid #30363d;
+  }
+
+  .header-left {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+  }
+
+  header h1 {
+    font-size: 1.1rem;
+    margin: 0;
+    color: #e6edf3;
+  }
+
+  .status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #6e7681;
+  }
+
+  .status-dot.connected {
+    background: #3fb950;
+  }
+
+  .status-dot.connecting {
+    background: #d29922;
+    animation: pulse 1s infinite;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+  }
+
+  .header-right {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+  }
+
+  .relay-input {
+    padding: 0.4rem 0.75rem;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    background: #0d1117;
+    color: #e6edf3;
+    font-size: 0.85rem;
+    width: 180px;
+  }
+
+  .status-text {
+    font-size: 0.85rem;
+    color: #8b949e;
+  }
+
+  .btn-primary, .btn-secondary {
+    padding: 0.4rem 1rem;
+    border-radius: 6px;
+    border: none;
+    font-size: 0.85rem;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+
+  .btn-primary {
+    background: #238636;
+    color: #fff;
+  }
+
+  .btn-primary:hover {
+    background: #2ea043;
+  }
+
+  .btn-secondary {
+    background: #30363d;
+    color: #e6edf3;
+  }
+
+  .btn-secondary:hover {
+    background: #484f58;
+  }
+
+  .btn-profile {
+    padding: 0.4rem 1rem;
+    border-radius: 6px;
+    border: none;
+    font-size: 0.85rem;
+    cursor: pointer;
+    transition: all 0.2s;
+    background: #21262d;
+    color: #e6edf3;
+    text-decoration: none;
+    display: inline-flex;
+    align-items: center;
+  }
+
+  .btn-profile:hover {
+    background: #30363d;
+  }
+
+  .container {
+    display: flex;
+    flex: 1;
+    overflow: hidden;
+  }
+
+  .sidebar {
+    width: 280px;
+    background: #161b22;
+    border-right: 1px solid #30363d;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .search-box {
+    padding: 1rem;
+  }
+
+  .empty-contacts {
+    padding: 1rem;
+    color: #8b949e;
+    font-size: 0.85rem;
+    text-align: center;
+  }
+
+  .search-box input {
+    width: 100%;
+    padding: 0.6rem 1rem;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    background: #0d1117;
+    color: #e6edf3;
+    box-sizing: border-box;
+  }
+
+  .contact-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 0 0.5rem 1rem;
+  }
+
+  .contact-item {
+    display: flex;
+    align-items: center;
+    width: 100%;
+    padding: 0.75rem;
+    border: none;
+    background: transparent;
+    border-radius: 6px;
+    cursor: pointer;
+    text-align: left;
+    color: #e6edf3;
+    margin-bottom: 0.25rem;
+  }
+
+  .contact-item:hover {
+    background: #1c2128;
+  }
+
+  .contact-item.active {
+    background: #21262d;
+  }
+
+  .avatar {
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    background: #30363d;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 600;
+    color: #8b949e;
+    flex-shrink: 0;
+  }
+
+  .avatar.large {
+    width: 48px;
+    height: 48px;
+    font-size: 1.2rem;
+  }
+
+  .contact-info {
+    flex: 1;
+    margin-left: 0.75rem;
+    min-width: 0;
+  }
+
+  .contact-name {
+    font-weight: 500;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .group-badge {
+    font-size: 0.7rem;
+    background: #388bfd33;
+    color: #58a6ff;
+    padding: 0.1rem 0.4rem;
+    border-radius: 4px;
+  }
+
+  .contact-preview {
+    font-size: 0.85rem;
+    color: #8b949e;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .contact-time {
+    font-size: 0.75rem;
+    color: #6e7681;
+    flex-shrink: 0;
+    margin-left: 0.5rem;
+  }
+
+  .chat-area {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .chat-header {
+    display: flex;
+    align-items: center;
+    padding: 1rem 1.5rem;
+    background: #161b22;
+    border-bottom: 1px solid #30363d;
+  }
+
+  .chat-header-info {
+    margin-left: 1rem;
+  }
+
+  .chat-header-name {
+    font-weight: 600;
+    font-size: 1rem;
+  }
+
+  .chat-header-status {
+    font-size: 0.8rem;
+    color: #8b949e;
+  }
+
+  .messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 1rem;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .empty-messages {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    color: #8b949e;
+  }
+
+  .empty-messages .hint {
+    font-size: 0.85rem;
+    margin-top: 0.5rem;
+  }
+
+  .message {
+    max-width: 70%;
+    margin-bottom: 0.75rem;
+  }
+
+  .message.sent {
+    align-self: flex-end;
+  }
+
+  .message.received {
+    align-self: flex-start;
+  }
+
+  .message-content {
+    padding: 0.6rem 1rem;
+    border-radius: 12px;
+  }
+
+  .message.sent .message-content {
+    background: #238636;
+    color: #fff;
+  }
+
+  .message.received .message-content {
+    background: #21262d;
+    color: #e6edf3;
+  }
+
+  .message-payload {
+    word-wrap: break-word;
+  }
+
+  .message-meta {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-top: 0.25rem;
+    font-size: 0.7rem;
+    opacity: 0.8;
+  }
+
+  .message-status {
+    font-style: italic;
+  }
+
+  .no-chat-selected {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    color: #8b949e;
+  }
+
+  .chat-input-area {
+    display: flex;
+    padding: 1rem 1.5rem;
+    background: #161b22;
+    border-top: 1px solid #30363d;
+    gap: 0.75rem;
+  }
+
+  .chat-input {
+    flex: 1;
+    padding: 0.6rem 1rem;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    background: #0d1117;
+    color: #e6edf3;
+    resize: none;
+    font-family: inherit;
+    font-size: 0.95rem;
+    max-height: 120px;
+  }
+
+  .chat-input:focus {
+    outline: none;
+    border-color: #58a6ff;
+  }
+
+  .btn-send {
+    padding: 0.6rem 1.5rem;
+    background: #238636;
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.2s;
+  }
+
+  .btn-send:hover:not(:disabled) {
+    background: #2ea043;
+  }
+
+  .btn-send:disabled {
+    background: #21262d;
+    color: #6e7681;
+    cursor: not-allowed;
+  }
+</style>

@@ -1,0 +1,29 @@
+{
+  "name": "decentralized-im",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite dev",
+    "build": "vite build",
+    "preview": "vite preview",
+    "tauri": "tauri dev",
+    "start": "npm run tauri",
+    "review": "cd src-tauri && cargo check 2>&1",
+    "relay:dev": "cd relay && cargo run",
+    "relay:start": "cd relay && cargo run",
+    "relay:build": "cd relay && cargo build --release"
+  },
+  "devDependencies": {
+    "@sveltejs/adapter-static": "^3.0.8",
+    "@sveltejs/kit": "^2.21.0",
+    "@sveltejs/vite-plugin-svelte": "^5.0.3",
+    "@tauri-apps/cli": "^2.5.0",
+    "svelte": "^5.28.2",
+    "typescript": "^5.8.3",
+    "vite": "^6.3.5"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.5.0"
+  }
+}

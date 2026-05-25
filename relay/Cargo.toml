@@ -1,0 +1,27 @@
+[package]
+name = "decentralized-im-relay"
+version = "0.1.0"
+edition = "2021"
+description = "Relay server for decentralized encrypted IM"
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+base64 = "0.22"
+parking_lot = "0.12"
+dirs = "6"
+futures-util = "0.3"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

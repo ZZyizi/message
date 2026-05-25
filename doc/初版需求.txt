@@ -1,0 +1,463 @@
+去中心化加密即时通讯系统（产品设计文档）
+1. 产品定位
+
+本系统是一个：
+
+弱中心化 + 端到端加密 + 设备为核心身份的即时通讯协议与应用系统
+
+核心目标：
+
+用户数据归用户设备所有
+消息传输依赖轻量 Relay（非强中心化服务器）
+支持群聊 / 私聊 / 多设备同步
+支持离线消息补发与最终一致性
+支持图片/视频/文件等媒体内容分布式存储
+2. 核心设计理念
+2.1 数据主权归用户
+用户身份 = 公私钥体系
+用户数据存储在本地设备
+服务器不保存明文数据
+2.2 弱中心化 Relay
+
+Relay 仅负责：
+
+WebSocket连接管理
+消息转发
+在线状态广播
+加密数据临时缓存（TTL）
+
+不负责：
+
+解密
+用户关系存储
+长期数据存储
+2.3 事件驱动模型
+
+所有数据均以事件形式存在：
+
+chat.message
+message.ack
+group.kick
+media.upload
+profile.update
+2.4 最终一致性
+
+系统不保证强一致：
+
+允许离线延迟同步
+允许局部缺失历史
+依赖补发机制逐步恢复状态
+3. 系统架构
+3.1 整体架构
+Client（核心）
+   ↓
+Relay（轻服务器）
+   ↓
+P2P / Device Sync / Cache Nodes
+3.2 模块划分
+（1）客户端（核心逻辑）
+
+负责：
+
+身份生成（公私钥）
+消息加密 / 解密
+本地数据库存储
+消息队列（待发送 / 未确认）
+历史同步逻辑
+媒体上传与下载
+（2）Relay服务器（轻量）
+
+职责：
+
+WebSocket连接管理
+在线用户映射
+消息广播
+临时加密消息缓存（TTL）
+群事件转发
+
+不具备业务逻辑能力
+
+（3）设备系统（Identity Layer）
+设备即节点
+多设备通过授权绑定同一身份
+支持设备授权 / 撤销
+4. 消息系统设计
+4.1 消息结构
+{
+  "event_id": "uuid",
+  "type": "chat.message",
+  "from": "pubkey",
+  "to": "group_id / pubkey",
+  "timestamp": 123456,
+  "payload": "encrypted_data",
+  "media_id": "optional"
+}
+4.2 ACK机制
+每条消息必须确认（ACK）
+未确认消息进入 pending queue
+设备上线后自动补发
+4.3 离线补发机制
+
+当目标用户上线：
+
+请求在线状态
+查询未ACK消息
+触发补发流程
+完成后删除队列
+5. 群聊设计
+5.1 群结构
+{
+  "group_id": "xxx",
+  "owner": "pubkey",
+  "admins": [],
+  "members": []
+}
+5.2 群主职责
+
+群主负责：
+
+群权限管理（踢人 / 拉人）
+群状态定义
+历史同步优先节点
+可选历史 checkpoint
+5.3 群消息同步策略
+
+优先级：
+
+群主设备
+管理员设备
+最近在线成员
+Relay缓存（fallback）
+
+采用：
+
+“分片同步 + 区间补齐”
+
+而非全量同步
+
+5.4 群一致性模型
+弱一致性
+最终一致
+不保证完整历史
+6. 多设备系统
+6.1 身份结构
+Identity Key（主身份）
+Device Key（设备身份）
+6.2 设备绑定流程
+主设备生成授权 token
+新设备扫码/连接
+完成公钥绑定
+同步历史数据
+6.3 设备同步策略
+P2P优先同步
+Relay辅助同步
+分片历史同步
+7. 媒体系统设计（图片/视频/文件）
+7.1 基本原则
+媒体不走消息流
+媒体独立存储
+消息只引用 media_id
+7.2 媒体结构
+{
+  "media_id": "sha256(file)",
+  "mime": "image/jpeg",
+  "size": 12345,
+  "encryption_key": "xxx",
+  "ttl": 7_days
+}
+7.3 上传流程
+客户端加密文件（AES-GCM）
+计算 hash（media_id）
+上传到存储节点
+广播 media reference event
+7.4 存储策略（3层）
+Level 1：发送者设备（主存）
+默认存储
+Level 2：群主/在线节点（备份）
+提高可用性
+Level 3：Relay缓存
+TTL临时存储（3~7天）
+7.5 下载流程
+获取 media_id
+查询多个节点
+下载加密 blob
+本地解密
+8. 同步机制设计
+8.1 群同步策略
+在线节点选择一个“同步提供者”
+避免多人同时同步造成风暴
+排队同步机制
+8.2 同步优先级
+
+优先选择：
+
+群主
+历史最完整节点
+延迟最低节点
+8.3 数据分片同步
+
+使用区间方式：
+
+sync_range: 1000-2000
+
+避免全量拉取
+
+9. 安全设计
+9.1 加密体系
+X25519（密钥交换）
+AES-GCM（消息加密）
+Ed25519（签名）
+9.2 安全目标
+Relay不可解密数据
+消息不可篡改
+身份不可伪造
+10. 系统特性总结
+优点
+去中心化身份
+用户数据完全本地化
+Relay轻量可扩展
+支持离线补发
+支持多设备
+支持媒体分布式存储
+约束
+弱一致性
+依赖在线节点同步
+群历史可能不完整
+设备离线影响可达性
+11. 产品定位总结
+
+该系统本质是：
+
+去中心化加密事件通信协议 + 分布式媒体网络 + 设备主权IM系统
+
+不是传统聊天软件，而是：
+
+IM协议
+分布式数据网络
+加密通信基础设施
+
+你这个系统本质不是“做一个聊天软件”，而是：
+
+一个 E2EE + 事件流协议 + 多端客户端 + 轻 Relay 网络
+
+所以技术栈要分三层选：
+协议层 / 客户端层 / Relay层 / 媒体层
+
+目标你提了三个关键约束：
+
+多端（Web / Desktop / Mobile）
+轻量（内存占用低）
+UI 现代化
+
+我给你一个偏“可落地 + 工程现实”的组合，而不是理想主义方案。
+
+1. 总体推荐技术栈（结论先给）
+🧠 协议 & 核心逻辑层（强烈建议统一）
+👉 Rust（核心推荐）
+
+原因非常关键：
+
+内存占用极低（对比 Node / JVM）
+非常适合加密（X25519 / Ed25519 / AES-GCM 都有成熟库）
+非常适合事件系统 & 网络层
+可编译到：
+WASM（Web）
+Native（Desktop / Mobile core）
+Server（Relay）
+
+👉 你这个系统“最核心的正确选择就是 Rust”
+
+2. 客户端技术栈（多端统一方案）
+
+你要的是：
+
+一套 UI + 多端 + 低内存 + 现代化
+
+⭐ 推荐方案：Tauri + Web UI
+🖥 Desktop（Windows / Mac / Linux）
+Tauri（核心推荐）
+比 Electron 轻 10x（内存通常 20~80MB）
+Rust 做后端核心逻辑
+Web 做 UI
+
+UI：
+
+React / Vue / Svelte（推荐 Svelte 或 React）
+📱 Mobile（iOS / Android）
+
+两种方案：
+
+方案 A（推荐统一架构）
+
+👉 Tauri Mobile（如果生态成熟） + Rust core
+
+或
+
+方案 B（更现实）
+
+👉 Flutter + Rust core（FFI）
+
+Flutter：UI
+Rust：加密 + sync + protocol core
+
+👉 这是目前工业界最稳组合
+
+🌐 Web 版本
+
+不要 Node 做核心逻辑！
+
+👉 使用：
+
+React / Vue / Svelte
+Rust → WASM
+
+核心逻辑：
+
+crypto（WASM）
+event engine（WASM）
+sync engine（WASM）
+3. Relay 服务器技术栈（轻量关键）
+
+你 Relay 的定义是：
+
+WebSocket + 转发 + TTL cache + 在线状态
+
+👉 推荐：Rust 或 Go（二选一）
+⭐ 推荐 Rust Relay（统一生态）
+tokio（高并发）
+axum（WebSocket + HTTP）
+redis（可选 TTL cache）
+sled / rocksdb（轻量缓存可选）
+
+优点：
+
+和客户端共享协议代码
+极低资源占用
+易部署（单 binary）
+备选：Go（更快开发）
+gorilla/websocket
+gin / fiber
+
+但：
+
+安全模型 + crypto 生态不如 Rust 统一
+4. 媒体系统技术栈
+
+你设计的是：
+
+加密 + 分布式 + 多节点 + TTL
+
+推荐方案
+存储层：
+👉 MinIO（强烈推荐）
+S3 兼容
+支持私有部署
+可做分布式节点
+CDN / 分发层（可选）
+Cloudflare R2（如果允许云）
+或自建 P2P（后期）
+加密：
+Rust crypto（ring / libsodium）
+AES-GCM + X25519
+5. UI 技术选型（关键）
+
+你说：
+
+“界面现代化 + 轻量 + 多端”
+
+推荐 UI 栈：
+⭐ 第一选择：Svelte + TailwindCSS
+
+原因：
+
+比 React 更轻
+编译后极小 bundle
+内存占用低
+非常适合 IM 类 UI
+第二选择：React + Zustand
+
+如果团队更熟 React：
+
+React
+Zustand（状态管理）
+Vite（构建）
+UI组件库：
+shadcn/ui（React）
+Skeleton UI（Svelte）
+6. 架构整合（关键设计）
+
+你最终系统会变成：
+
+                ┌──────────────┐
+                │   Web App    │
+                │ React/Svelte │
+                └──────┬───────┘
+                       │ WASM
+        ┌──────────────▼──────────────┐
+        │     Rust Protocol Core       │
+        │ crypto / sync / event engine │
+        └──────┬──────────────┬───────┘
+               │              │
+        ┌──────▼───┐   ┌──────▼─────┐
+        │ Relay     │   │ Local DB   │
+        │ (Rust)    │   │ SQLite /   │
+        │ WebSocket │   │ IndexedDB  │
+        └──────┬───┘   └────────────┘
+               │
+        ┌──────▼──────┐
+        │ Media Nodes  │
+        │ MinIO / P2P  │
+        └──────────────┘
+7. 为什么这个组合是最优解
+✔ 你这个系统的本质是：
+
+不是“IM App”，而是：
+
+分布式事件系统
+加密通信协议
+多端同步引擎
+所以必须满足：
+1. 协议必须跨端一致
+
+👉 Rust + WASM
+
+2. UI必须轻
+
+👉 Svelte / React
+
+3. Relay必须极轻
+
+👉 Rust / Go
+
+4. 内存低
+
+👉 不用 Electron / Node 做核心
+
+8. 不推荐的技术（帮你避坑）
+
+❌ Electron（太重）
+❌ Java / Spring（太重）
+❌ Node.js 做 core（安全 + 内存问题）
+❌ Python backend（不适合实时 IM）
+❌ Firebase / Supabase（违背去中心化）
+
+9. 最终推荐技术栈总结（精简版）
+🧠 Core Protocol
+Rust
+Tokio
+Ring / Libsodium
+🖥 Desktop
+Tauri
+Svelte or React
+📱 Mobile
+Flutter + Rust FFI
+🌐 Web
+React / Svelte + WASM
+⚡ Relay
+Rust + Axum + WebSocket
+📦 Storage
+MinIO + S3 API
+💾 Local DB
+SQLite（桌面）
+IndexedDB（Web）
+Realm（可选 mobile）

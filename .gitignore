@@ -1,0 +1,65 @@
+# ========================
+# Rust / Tauri
+# ========================
+**/target/
+**/Cargo.lock
+**/.cargo/
+**/.rustflags
+
+# ========================
+# Node / SvelteKit
+# ========================
+**/node_modules
+**/.svelte-kit/
+**/build/
+**/.vite/
+
+# ========================
+# IDE
+# ========================
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*~
+
+# ========================
+# OS
+# ========================
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ========================
+# Environment
+# ========================
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# ========================
+# Logs
+# ========================
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ========================
+# Tauri specific
+# ========================
+src-tauri/gen/
+src-tauri/icons/
+
+# ========================
+# Relay
+# ========================
+relay/target/
