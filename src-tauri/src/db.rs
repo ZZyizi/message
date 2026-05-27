@@ -76,6 +76,18 @@ pub struct PendingMessage {
     pub retry_count: i32,        // 重试次数
 }
 
+/// 联系人记录结构
+///
+/// 存储在 contacts 表中，昵称使用 AES-256-GCM 加密后存储。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Contact {
+    pub id: String,
+    pub pubkey: String,
+    pub encrypted_nickname: Option<String>,
+    pub last_seen: i64,
+    pub created_at: i64,
+}
+
 /// 数据库连接包装器
 ///
 /// 封装 rusqlite Connection，提供类型安全的数据库操作。
@@ -169,6 +181,16 @@ impl Database {
                 id TEXT PRIMARY KEY,
                 pubkey TEXT NOT NULL,
                 encrypted_private TEXT NOT NULL,
+                nickname TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL
+            );
+
+            -- 联系人表：存储联系人信息（昵称加密存储）
+            CREATE TABLE IF NOT EXISTS contacts (
+                id TEXT PRIMARY KEY,
+                pubkey TEXT NOT NULL UNIQUE,
+                encrypted_nickname TEXT,
+                last_seen INTEGER DEFAULT 0,
                 created_at INTEGER NOT NULL
             );
 
@@ -185,6 +207,13 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_pending_created ON pending_messages(created_at);
             "#,
         )?;
+
+        // 迁移：为已有的 identities 表添加 nickname 列（若已存在则忽略）
+        let _ = self.conn.execute(
+            "ALTER TABLE identities ADD COLUMN nickname TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+
         Ok(())
     }
 
@@ -452,8 +481,8 @@ impl Database {
     /// 使用 INSERT OR REPLACE，相同 id 的记录会被更新。
     pub fn save_identity(&self, pubkey: &str, encrypted_private: &str) -> Result<(), Error> {
         self.conn.execute(
-            r#"INSERT OR REPLACE INTO identities (id, pubkey, encrypted_private, created_at)
-               VALUES ('default', ?1, ?2, ?3)"#,
+            r#"INSERT OR REPLACE INTO identities (id, pubkey, encrypted_private, nickname, created_at)
+               VALUES ('default', ?1, ?2, '', ?3)"#,
             params![pubkey, encrypted_private, Utc::now().timestamp()],
         )?;
         Ok(())
@@ -468,6 +497,98 @@ impl Database {
             .query_row([], |row| Ok((row.get(0)?, row.get(1)?)))
             .optional()?;
         Ok(identity)
+    }
+
+    /// 保存昵称
+    pub fn set_nickname(&self, nickname: &str) -> Result<(), Error> {
+        self.conn.execute(
+            "UPDATE identities SET nickname = ?1 WHERE id = 'default'",
+            params![nickname],
+        )?;
+        Ok(())
+    }
+
+    /// 获取昵称
+    pub fn get_nickname(&self) -> Result<Option<String>, Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT nickname FROM identities WHERE id = 'default'"
+        )?;
+        let nickname = stmt
+            .query_row([], |row| row.get(0))
+            .optional()?;
+        Ok(nickname)
+    }
+
+    // ========== 联系人操作 ==========
+
+    /// 添加或更新联系人
+    ///
+    /// 若 pubkey 已存在则更新昵称，否则插入新记录。
+    pub fn upsert_contact(&self, pubkey: &str, encrypted_nickname: Option<&str>) -> Result<(), Error> {
+        let now = Utc::now().timestamp();
+        self.conn.execute(
+            r#"INSERT INTO contacts (id, pubkey, encrypted_nickname, last_seen, created_at)
+               VALUES (?1, ?2, ?3, 0, ?4)
+               ON CONFLICT(pubkey) DO UPDATE SET encrypted_nickname = ?3"#,
+            params![uuid::Uuid::new_v4().to_string(), pubkey, encrypted_nickname, now],
+        )?;
+        Ok(())
+    }
+
+    /// 获取所有联系人
+    pub fn get_contacts(&self) -> Result<Vec<Contact>, Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, pubkey, encrypted_nickname, last_seen, created_at FROM contacts ORDER BY last_seen DESC"
+        )?;
+        let mut contacts = Vec::new();
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            contacts.push(Contact {
+                id: row.get(0)?,
+                pubkey: row.get(1)?,
+                encrypted_nickname: row.get(2)?,
+                last_seen: row.get(3)?,
+                created_at: row.get(4)?,
+            });
+        }
+        Ok(contacts)
+    }
+
+    /// 根据公钥获取联系人
+    pub fn get_contact_by_pubkey(&self, pubkey: &str) -> Result<Option<Contact>, Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, pubkey, encrypted_nickname, last_seen, created_at FROM contacts WHERE pubkey = ?1"
+        )?;
+        let contact = stmt
+            .query_row(params![pubkey], |row| {
+                Ok(Contact {
+                    id: row.get(0)?,
+                    pubkey: row.get(1)?,
+                    encrypted_nickname: row.get(2)?,
+                    last_seen: row.get(3)?,
+                    created_at: row.get(4)?,
+                })
+            })
+            .optional()?;
+        Ok(contact)
+    }
+
+    /// 更新联系人最后在线时间
+    pub fn update_contact_last_seen(&self, pubkey: &str, timestamp: i64) -> Result<(), Error> {
+        self.conn.execute(
+            "UPDATE contacts SET last_seen = ?1 WHERE pubkey = ?2",
+            params![timestamp, pubkey],
+        )?;
+        Ok(())
+    }
+
+    /// 删除联系人
+    pub fn delete_contact(&self, pubkey: &str) -> Result<(), Error> {
+        self.conn.execute(
+            "DELETE FROM contacts WHERE pubkey = ?1",
+            params![pubkey],
+        )?;
+        Ok(())
     }
 
     /// 保存设置键值对

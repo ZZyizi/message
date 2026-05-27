@@ -12,21 +12,43 @@
   let contacts = $state([]);
   let isConnected = $state(false);
   let myPubkey = $state('');
+  let myNickname = $state('');
 
   onMount(async () => {
-    // 获取我的公钥
+    // 获取我的公钥和昵称
     try {
       myPubkey = await invoke('get_public_key');
+      myNickname = await invoke('get_nickname') || '';
     } catch (e) {
       console.error('Failed to get pubkey:', e);
+    }
+
+    // 同步后端连接状态（页面重新挂载时恢复 UI）
+    try {
+      const relayStatus = await invoke('get_status');
+      if (relayStatus.state === 'connected') {
+        status = 'connected';
+        isConnected = true;
+        relayUrl = relayStatus.relay_url || relayUrl;
+        await loadContacts();
+      }
+    } catch (e) {
+      console.error('Failed to get relay status:', e);
     }
 
     // 订阅新消息事件
     const unlistenNewMsg = await listen('new_message', (event) => {
       const msg = event.payload;
-      // 如果是当前聊天对象的消息，添加到列表
-      if (currentContact && (msg.from_pubkey === myPubkey || msg.from_pubkey === currentContact.pubkey || msg.to_recipient === currentContact.pubkey)) {
-        messages = [...messages, msg];
+      // 只处理与当前聊天对象相关的消息
+      if (currentContact) {
+        const isFromCurrentContact = msg.from_pubkey === currentContact.pubkey;
+        const isToCurrentContact = msg.to_recipient === currentContact.pubkey && msg.from_pubkey === myPubkey;
+        if (isFromCurrentContact || isToCurrentContact) {
+          // 避免重复：检查是否已存在相同 event_id
+          if (!messages.some(m => m.event_id === msg.event_id)) {
+            messages = [...messages, msg];
+          }
+        }
       }
     });
 
@@ -36,21 +58,27 @@
       messages = messages.map(m => m.event_id === eventId ? { ...m, recalled: true } : m);
     });
 
+    // 定时刷新联系人列表（每 15 秒）
+    const refreshInterval = setInterval(async () => {
+      if (isConnected) {
+        await loadContacts();
+      }
+    }, 15000);
+
     return () => {
       unlistenNewMsg();
       unlistenRecall();
+      clearInterval(refreshInterval);
     };
   });
 
   async function connect() {
     try {
       status = 'connecting';
-      await invoke('auto_create_identity');
-      myPubkey = await invoke('get_public_key');
       const result = await invoke('connect', { relayUrl });
       status = 'connected';
       isConnected = true;
-      await loadOnlineUsers();
+      await loadContacts();
     } catch (e) {
       console.error('Failed to connect:', e);
       showToast('连接失败: ' + (e?.message || e));
@@ -58,31 +86,21 @@
     }
   }
 
-  async function loadOnlineUsers() {
+  async function loadContacts() {
     if (!isConnected) return;
     try {
-      const users = await invoke('get_online_users');
-      console.log('Online users:', users);
-      console.log('My pubkey:', myPubkey);
-
-      if (!users || users.length === 0) {
-        contacts = [];
-        return;
-      }
-
-      const newContacts = users.map((pubkey, index) => ({
-        id: `user_${index}`,
-        name: pubkey === myPubkey ? 'Me (' + pubkey.substring(0, 8) + '...)' : pubkey.substring(0, 8) + '...',
-        pubkey: pubkey,
+      const result = await invoke('sync_online_contacts');
+      contacts = (result || []).map((c, index) => ({
+        id: `contact_${index}`,
+        name: c.nickname || (c.pubkey.substring(0, 8) + '...'),
+        pubkey: c.pubkey,
+        is_online: c.is_online,
+        last_seen: c.last_seen,
         lastMessage: '',
-        lastTime: '',
+        lastTime: '', 
       }));
-
-      console.log('New contacts:', newContacts);
-      contacts = [...newContacts];
-      console.log('Contacts state:', contacts);
     } catch (e) {
-      console.error('Failed to load online users:', e);
+      console.error('Failed to load contacts:', e);
     }
   }
 
@@ -186,7 +204,7 @@
       </div>
       <nav class="contact-list">
         {#if contacts.length === 0}
-          <div class="empty-contacts">No contacts online</div>
+          <div class="empty-contacts">暂无联系人</div>
         {/if}
         {#each contacts as contact}
           <button
@@ -200,9 +218,7 @@
             <div class="contact-info">
               <div class="contact-name">
                 {contact.name}
-                {#if contact.isGroup}
-                  <span class="group-badge">Group</span>
-                {/if}
+                <span class="online-dot" class:online={contact.is_online}></span>
               </div>
               <div class="contact-preview">{contact.lastMessage}</div>
             </div>
@@ -221,7 +237,7 @@
           <div class="chat-header-info">
             <div class="chat-header-name">{currentContact.name}</div>
             <div class="chat-header-status">
-              {isConnected ? 'Online' : 'Offline'}
+              {currentContact.is_online ? '在线' : '离线'}
             </div>
           </div>
         </div>
@@ -482,6 +498,18 @@
     gap: 0.5rem;
   }
 
+  .online-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #6e7681;
+    flex-shrink: 0;
+  }
+
+  .online-dot.online {
+    background: #3fb950;
+  }
+
   .group-badge {
     font-size: 0.7rem;
     background: #388bfd33;
@@ -530,7 +558,7 @@
 
   .chat-header-status {
     font-size: 0.8rem;
-    color: #8b949e;
+    color: #3fb950;
   }
 
   .messages {

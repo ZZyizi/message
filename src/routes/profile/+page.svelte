@@ -6,6 +6,7 @@
   let username = $state('');
   let isLoading = $state(false);
   let pubkey = $state('');
+  let saveTimer = null;
 
   onMount(async () => {
     await loadProfile();
@@ -15,10 +16,26 @@
     try {
       isLoading = true;
       pubkey = await invoke('get_public_key');
+      const savedNickname = await invoke('get_nickname');
+      username = savedNickname || '';
     } catch (e) {
       console.error('Failed to load profile:', e);
     } finally {
       isLoading = false;
+    }
+  }
+
+  function onNicknameInput() {
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => saveNickname(), 500);
+  }
+
+  async function saveNickname() {
+    try {
+      await invoke('set_nickname', { nickname: username });
+    } catch (e) {
+      console.error('Failed to save nickname:', e);
+      showToast('保存失败: ' + (e?.message || e));
     }
   }
 
@@ -31,7 +48,8 @@
       isLoading = true;
       const result = await invoke('auto_create_identity');
       pubkey = result;
-      showToast('身份创建成功！');
+      await saveNickname();
+      showToast('身份创建成功！', 'success');
     } catch (e) {
       console.error('Failed to create identity:', e);
       showToast('创建失败: ' + (e?.message || e));
@@ -60,6 +78,7 @@
             id="username"
             type="text"
             bind:value={username}
+            oninput={onNicknameInput}
             placeholder="输入用户名"
             disabled={isLoading}
           />

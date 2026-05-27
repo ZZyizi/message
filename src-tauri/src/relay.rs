@@ -22,6 +22,7 @@ use crate::Error;
 /// - `MessageRecall`: 消息撤回，请求删除指定消息
 /// - `Ping/Pong`: 心跳保活消息
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum WsMessage {
     ChatMessage {
         event_id: String,
@@ -488,11 +489,10 @@ pub fn subscribe_messages() -> Result<(), Error> {
     Ok(())
 }
 
-/// 获取在线用户列表
+/// 获取在线用户列表（内部实现，可被其他模块调用）
 ///
 /// 连接 relay 服务器后，通过 HTTP 请求获取当前在线的所有用户公钥列表。
-#[tauri::command]
-pub async fn get_online_users(_state: tauri::State<'_, crate::AppState>) -> Result<Vec<String>, Error> {
+pub async fn fetch_online_users() -> Result<Vec<String>, Error> {
     let relay_url = RELAY_URL.read().clone()
         .ok_or_else(|| Error::Relay("Not connected to relay".to_string()))?;
 
@@ -500,9 +500,7 @@ pub async fn get_online_users(_state: tauri::State<'_, crate::AppState>) -> Resu
     let url = relay_url
         .trim_end_matches('/')
         .replace("ws://", "http://")
-        .replace("wss://", "https://")
-        .replace("http://", "http://")
-        .replace("https://", "https://");
+        .replace("wss://", "https://");
 
     let url = format!("{}/users", url);
 
@@ -522,4 +520,10 @@ pub async fn get_online_users(_state: tauri::State<'_, crate::AppState>) -> Resu
         .unwrap_or_default();
 
     Ok(users)
+}
+
+/// 获取在线用户列表（Tauri 命令）
+#[tauri::command]
+pub async fn get_online_users() -> Result<Vec<String>, Error> {
+    fetch_online_users().await
 }

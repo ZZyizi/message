@@ -7,6 +7,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod contact;    // 联系人管理模块
 mod crypto;    // 加密原语模块
 mod db;         // SQLite 数据库层
 mod error;      // 统一错误类型
@@ -31,6 +32,8 @@ pub use error::Error;
 pub struct AppState {
     /// 数据库连接，使用 Mutex 保证线程安全
     pub db: Arc<Mutex<db::Database>>,
+    /// 身份数据库连接
+    pub identity_db: Arc<Mutex<db::Database>>,
     /// 身份管理器，使用 RwLock 支持并发读
     pub identity: Arc<RwLock<identity::IdentityManager>>,
     /// Tauri 应用句柄
@@ -100,6 +103,11 @@ pub fn run() {
             let db = db::Database::new(&db_path)
                 .expect("Failed to initialize database");
 
+            // 初始化身份数据库
+            let identity_db_path = app_data_dir.join("identity.db");
+            let identity_db = db::Database::new(&identity_db_path)
+                .expect("Failed to initialize identity database");
+
             // 初始化身份管理器
             let identity = identity::IdentityManager::new(&app_data_dir)
                 .expect("Failed to initialize identity manager");
@@ -107,6 +115,7 @@ pub fn run() {
             // 构建并注册全局状态
             let state = AppState {
                 db: Arc::new(Mutex::new(db)),
+                identity_db: Arc::new(Mutex::new(identity_db)),
                 identity: Arc::new(RwLock::new(identity)),
                 app_handle: app.handle().clone(),
             };
@@ -127,6 +136,13 @@ pub fn run() {
             identity::export_identity_mnemonic,
             identity::import_identity_mnemonic,
             identity::auto_create_identity,
+            identity::get_nickname,
+            identity::set_nickname,
+            // 联系人命令
+            contact::save_contact,
+            contact::get_contacts,
+            contact::delete_contact,
+            contact::sync_online_contacts,
             // 消息命令
             message::send_message,
             message::get_messages,

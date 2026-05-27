@@ -7,7 +7,6 @@
 
 use std::path::Path;
 use base64::Engine;
-use tauri::Manager;
 
 use crate::crypto;
 use crate::db::Database;
@@ -38,6 +37,8 @@ pub struct IdentityManager {
     pubkey: Option<String>,
     /// 加密后的私钥（Base64 编码）
     encrypted_private: Option<String>,
+    /// 用户昵称
+    nickname: String,
 }
 
 impl IdentityManager {
@@ -48,15 +49,19 @@ impl IdentityManager {
         let db_path = app_data_dir.join("identity.db");
         let db = Database::new(&db_path)?;
 
+        let nickname = db.get_nickname()?.unwrap_or_default();
+
         let identity = if let Some((pubkey, encrypted_private)) = db.get_identity()? {
             Self {
                 pubkey: Some(pubkey),
                 encrypted_private: Some(encrypted_private),
+                nickname,
             }
         } else {
             Self {
                 pubkey: None,
                 encrypted_private: None,
+                nickname: String::new(),
             }
         };
 
@@ -71,6 +76,16 @@ impl IdentityManager {
     /// 获取公钥（若无身份返回 None）
     pub fn get_public_key(&self) -> Option<&str> {
         self.pubkey.as_deref()
+    }
+
+    /// 获取昵称
+    pub fn get_nickname(&self) -> &str {
+        &self.nickname
+    }
+
+    /// 设置昵称
+    pub fn set_nickname(&mut self, nickname: &str) {
+        self.nickname = nickname.to_string();
     }
 
     /// 生成新身份密钥对
@@ -98,7 +113,6 @@ impl IdentityManager {
     /// 若无身份则生成新密钥对，使用全零密钥加密私钥后存储到数据库。
     /// 用于开发阶段无需手动导入助记词。
     ///
-    /// - `db`: 数据库连接，用于持久化存储
     /// - 返回新生成的公钥
     pub fn auto_create_identity(&mut self, db: &Database) -> Result<String, Error> {
         let zero_key = [0u8; 32];
@@ -284,15 +298,35 @@ pub fn auto_create_identity(
             .ok_or_else(|| Error::Identity("No identity found".to_string()));
     }
 
-    // 获取 identity.db 路径（与 IdentityManager::new 相同路径）
-    let app_data_dir = state.app_handle.path().app_data_dir()
-        .map_err(|e| Error::Identity(format!("Failed to get app data dir: {}", e)))?;
-    let identity_db_path = app_data_dir.join("identity.db");
-    tracing::info!("Creating identity DB at: {:?}", identity_db_path);
-    let identity_db = crate::db::Database::new(&identity_db_path)?;
-
+    let identity_db = state.identity_db.lock().map_err(|e| Error::Identity(format!("Identity DB lock poisoned: {}", e)))?;
     let pubkey = identity.auto_create_identity(&identity_db)?;
     tracing::info!("Identity created and saved, pubkey: {}", pubkey);
 
     Ok(pubkey)
+}
+
+/// 获取用户昵称
+#[tauri::command]
+pub fn get_nickname(state: tauri::State<'_, crate::AppState>) -> Result<String, Error> {
+    let identity = state.identity.read();
+    Ok(identity.get_nickname().to_string())
+}
+
+/// 设置用户昵称
+///
+/// 同时更新内存和数据库中的昵称。
+#[tauri::command]
+pub fn set_nickname(
+    nickname: String,
+    state: tauri::State<'_, crate::AppState>,
+) -> Result<(), Error> {
+    // 更新数据库
+    let identity_db = state.identity_db.lock().map_err(|e| Error::Identity(format!("Identity DB lock poisoned: {}", e)))?;
+    identity_db.set_nickname(&nickname)?;
+    // 更新内存
+    let mut identity = state.identity.write();
+    identity.set_nickname(&nickname);
+
+    tracing::info!("Nickname updated to: {}", nickname);
+    Ok(())
 }
