@@ -106,22 +106,12 @@ pub async fn sync_online_contacts(
         }
     }
 
-    // 获取当前用户公钥（排除自己）
-    let my_pubkey = {
-        let identity = state.identity.read();
-        identity.get_public_key().map(|s| s.to_string()).unwrap_or_default()
-    };
-
     // 读取所有联系人并解密昵称
     let db = state.identity_db.lock().unwrap();
     let contacts = db.get_contacts()?;
     let mut result = Vec::new();
 
     for contact in contacts {
-        if contact.pubkey == my_pubkey {
-            continue; // 排除自己
-        }
-
         let nickname = decrypt_nickname(contact.encrypted_nickname.as_deref());
         let is_online = online_set.contains(&contact.pubkey);
 
@@ -135,9 +125,6 @@ pub async fn sync_online_contacts(
 
     // 把在线但不在联系人表中的用户也加入结果
     for pubkey in &online_pubkeys {
-        if pubkey == &my_pubkey {
-            continue;
-        }
         if !result.iter().any(|c| &c.pubkey == pubkey) {
             result.push(ContactInfo {
                 pubkey: pubkey.clone(),

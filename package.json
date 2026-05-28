@@ -12,7 +12,8 @@
     "review": "cd src-tauri && cargo check 2>&1",
     "relay:dev": "cd relay && cargo run",
     "relay:start": "cd relay && cargo run",
-    "relay:build": "cd relay && cargo build --release"
+    "relay:build": "cd relay && cargo build --release",
+    "test:e2e": "node test/e2e-chat.mjs"
   },
   "devDependencies": {
     "@sveltejs/adapter-static": "^3.0.8",
@@ -24,6 +25,7 @@
     "vite": "^6.3.5"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2.5.0"
+    "@tauri-apps/api": "^2.5.0",
+    "ws": "^8.21.0"
   }
 }

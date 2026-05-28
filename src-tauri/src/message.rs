@@ -129,6 +129,12 @@ pub async fn get_chat_messages(
     let db = state.db.lock().unwrap();
     let limit = limit.unwrap_or(100);
 
+    // 自己发给自己时只查一次，避免重复
+    if my_pubkey == peer_pubkey {
+        let messages = db.get_messages(&my_pubkey, None, limit)?;
+        return Ok(messages);
+    }
+
     // 查询我发送给对方的消息
     let sent = db.get_messages(&peer_pubkey, None, limit)?;
     // 查询对方发送给我的消息（我作为接收者）

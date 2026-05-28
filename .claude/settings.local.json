@@ -41,7 +41,10 @@
       "Bash(cargo clean *)",
       "Bash(taskkill //F //IM \"decentralized-im.exe\")",
       "Bash(taskkill //F //IM \"decentralized-im-relay.exe\")",
-      "Bash(taskkill //F //IM decentralized-im.exe)"
+      "Bash(taskkill //F //IM decentralized-im.exe)",
+      "mcp__codegraph__codegraph_context",
+      "Bash(cmd.exe /c \"where npm\")",
+      "Bash(cmd.exe /c \"node -v\")"
     ]
   }
 }

@@ -248,22 +248,18 @@ async fn handle_chat_message(state: &Arc<AppState>, msg: &serde_json::Value) -> 
         );
     }
 
-    // 接收者在线：直接转发
-    if let Some(session) = state.clients.read().get(to) {
+    // 接收者在线：直接转发（不回显给发送者，发送者已在本地存储）
+    let clients = state.clients.read();
+    if let Some(session) = clients.get(to) {
         let ws_msg: WsMessage =
             serde_json::from_value(msg.clone()).map_err(|e| e.to_string())?;
         if session.tx.send(ws_msg).is_err() {
             warn!("Failed to forward to {}", to);
+        } else {
+            info!("Message forwarded: {} -> {} (event_id: {})", from, to, event_id);
         }
-    }
-
-    // 发送者也在线：给自己发一份（客户端用于本地存储）
-    if from != to {
-        if let Some(session) = state.clients.read().get(from) {
-            let ws_msg: WsMessage =
-                serde_json::from_value(msg.clone()).map_err(|e| e.to_string())?;
-            let _ = session.tx.send(ws_msg);
-        }
+    } else {
+        info!("Recipient {} offline, message cached only (event_id: {})", to, event_id);
     }
 
     Ok(())

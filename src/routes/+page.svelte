@@ -36,18 +36,16 @@
       console.error('Failed to get relay status:', e);
     }
 
-    // 订阅新消息事件
+    // 订阅新消息事件（只处理来自对方的消息，忽略自己的回显）
     const unlistenNewMsg = await listen('new_message', (event) => {
       const msg = event.payload;
+      // 忽略自己发送的消息（relay 会回显给发送者）
+      if (msg.from_pubkey === myPubkey) return;
       // 只处理与当前聊天对象相关的消息
-      if (currentContact) {
-        const isFromCurrentContact = msg.from_pubkey === currentContact.pubkey;
-        const isToCurrentContact = msg.to_recipient === currentContact.pubkey && msg.from_pubkey === myPubkey;
-        if (isFromCurrentContact || isToCurrentContact) {
-          // 避免重复：检查是否已存在相同 event_id
-          if (!messages.some(m => m.event_id === msg.event_id)) {
-            messages = [...messages, msg];
-          }
+      if (currentContact && msg.from_pubkey === currentContact.pubkey) {
+        // 避免重复：检查是否已存在相同 event_id
+        if (!messages.some(m => m.event_id === msg.event_id)) {
+          messages = [...messages, msg];
         }
       }
     });
@@ -90,15 +88,22 @@
     if (!isConnected) return;
     try {
       const result = await invoke('sync_online_contacts');
-      contacts = (result || []).map((c, index) => ({
-        id: `contact_${index}`,
-        name: c.nickname || (c.pubkey.substring(0, 8) + '...'),
-        pubkey: c.pubkey,
-        is_online: c.is_online,
-        last_seen: c.last_seen,
-        lastMessage: '',
-        lastTime: '', 
-      }));
+      contacts = (result || []).map((c, index) => {
+        const isMe = c.pubkey === myPubkey;
+        const displayName = isMe
+          ? (myNickname ? myNickname + ' (我)' : '我')
+          : (c.nickname || (c.pubkey.substring(0, 8) + '...'));
+        return {
+          id: `contact_${index}`,
+          name: displayName,
+          pubkey: c.pubkey,
+          is_online: c.is_online,
+          is_me: isMe,
+          last_seen: c.last_seen,
+          lastMessage: '',
+          lastTime: '',
+        };
+      });
     } catch (e) {
       console.error('Failed to load contacts:', e);
     }

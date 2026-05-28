@@ -222,7 +222,7 @@ impl Database {
     /// 新消息默认 delivered=0, recalled=0。
     pub fn insert_message(&self, msg: &Message) -> Result<(), Error> {
         self.conn.execute(
-            r#"INSERT INTO messages (id, event_id, msg_type, from_pubkey, to_recipient, payload, media_id, timestamp, seq_id, signature, delivered, recalled)
+            r#"INSERT OR IGNORE INTO messages (id, event_id, msg_type, from_pubkey, to_recipient, payload, media_id, timestamp, seq_id, signature, delivered, recalled)
                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"#,
             params![
                 msg.id,

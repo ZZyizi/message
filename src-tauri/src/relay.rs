@@ -6,7 +6,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 use tracing::{info, warn, error, debug};
 use base64::Engine;
 use urlencoding::encode;
@@ -75,12 +75,13 @@ static CONNECTED: AtomicBool = AtomicBool::new(false);
 static RELAY_URL: RwLock<Option<String>> = RwLock::new(None);
 static LAST_PING: RwLock<Option<i64>> = RwLock::new(None);
 static CLIENT_STATE: RwLock<ConnectionState> = RwLock::new(ConnectionState::Disconnected);
-/// 消息广播 channel，发送端广播消息，多个接收端可订阅
-static MESSAGE_TX: RwLock<Option<broadcast::Sender<WsMessage>>> = RwLock::new(None);
+/// 出站消息 channel，用于将消息发送到 Relay WebSocket
+static OUTBOUND_TX: RwLock<Option<mpsc::Sender<WsMessage>>> = RwLock::new(None);
 
 /// 连接到 Relay 服务器
 ///
 /// 若已存在连接则先断开，然后建立新的 WebSocket 连接。
+/// 使用 oneshot channel 等待 WebSocket 实际连接成功后再返回。
 /// 连接成功后会将 relay_url 持久化到数据库设置中。
 #[tauri::command]
 pub async fn connect(
@@ -96,10 +97,6 @@ pub async fn connect(
 
     *RELAY_URL.write() = Some(relay_url.clone());
     *CLIENT_STATE.write() = ConnectionState::Connecting;
-
-    // 初始化消息广播 channel，缓冲区容量 100
-    let (tx, _) = broadcast::channel(100);
-    *MESSAGE_TX.write() = Some(tx.clone());
 
     let pubkey_str = {
         let identity = state.identity.read();
@@ -117,19 +114,33 @@ pub async fn connect(
 
     info!("Connecting to WebSocket: {}", path);
 
-    // 异步启动 WebSocket 客户端，不阻塞当前调用
+    // 使用 oneshot channel 等待 WebSocket 连接结果
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
     let app_handle = state.app_handle.clone();
+
     tokio::spawn(async move {
-        if let Err(e) = run_websocket_client(path, tx, app_handle).await {
-            error!("WebSocket error: {}", e);
-        }
+        run_websocket_client(path, app_handle, ready_tx).await;
     });
 
-    // 等待连接建立（500ms 等待握手完成）
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    // 等待 WebSocket 连接结果（最多 10 秒）
+    match tokio::time::timeout(tokio::time::Duration::from_secs(10), ready_rx).await {
+        Ok(Ok(Ok(()))) => {
+            info!("Connected to relay successfully");
+        }
+        Ok(Ok(Err(e))) => {
+            *CLIENT_STATE.write() = ConnectionState::Disconnected;
+            return Err(Error::Relay(format!("WebSocket connect failed: {}", e)));
+        }
+        Ok(Err(_)) => {
+            *CLIENT_STATE.write() = ConnectionState::Disconnected;
+            return Err(Error::Relay("WebSocket task panicked".to_string()));
+        }
+        Err(_) => {
+            *CLIENT_STATE.write() = ConnectionState::Disconnected;
+            return Err(Error::Relay("WebSocket connect timed out".to_string()));
+        }
+    }
 
-    *CLIENT_STATE.write() = ConnectionState::Connected;
-    CONNECTED.store(true, Ordering::SeqCst);
     *LAST_PING.write() = Some(chrono::Utc::now().timestamp_millis());
 
     {
@@ -137,7 +148,6 @@ pub async fn connect(
         db.set_setting("relay_url", &relay_url)?;
     }
 
-    info!("Connected to relay successfully");
     Ok(())
 }
 
@@ -148,47 +158,86 @@ pub async fn connect(
 /// 2. 每 30 秒发送一次 Ping 心跳
 /// 3. 接收并广播收到的新消息（存入数据库并通知前端）
 /// 4. 检测 120 秒无响应视为连接断开
-async fn run_websocket_client(relay_url: String, tx: broadcast::Sender<WsMessage>, app_handle: tauri::AppHandle) -> Result<(), Error> {
+///
+/// 使用 mpsc channel 管理出站消息：send_chat_message 通过 OUTBOUND_TX 发送，
+/// 写任务从 mpsc 接收并写入 WebSocket。
+async fn run_websocket_client(
+    relay_url: String,
+    app_handle: tauri::AppHandle,
+    ready_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
+) {
     use tokio_tungstenite::{connect_async, tungstenite::Message};
     use futures_util::{StreamExt, SinkExt};
 
     info!("Connecting to WebSocket: {}", relay_url);
 
-    let (ws_stream, _) = connect_async(&relay_url)
-        .await
-        .map_err(|e| Error::Relay(format!("WebSocket connect failed: {}", e)))?;
+    let ws_result = connect_async(&relay_url).await;
+    let (ws_stream, _) = match ws_result {
+        Ok(pair) => pair,
+        Err(e) => {
+            let msg = format!("WebSocket connect failed: {}", e);
+            error!("{}", msg);
+            let _ = ready_tx.send(Err(msg));
+            return;
+        }
+    };
 
     info!("WebSocket connected");
+
+    // 创建出站消息 mpsc channel
+    let (outbound_tx, mut outbound_rx) = mpsc::channel::<WsMessage>(100);
+
+    // 存储出站 channel 到全局状态（供 send_chat_message 等使用）
+    *OUTBOUND_TX.write() = Some(outbound_tx);
+
+    // 通知 connect() 函数连接已成功
+    let _ = ready_tx.send(Ok(()));
 
     *CLIENT_STATE.write() = ConnectionState::Connected;
     CONNECTED.store(true, Ordering::SeqCst);
 
-    let (mut write, mut read) = ws_stream.split();
+    let (mut ws_write, mut ws_read) = ws_stream.split();
 
-    // 心跳任务：每 30 秒发送一次 Ping
-    let tx_clone = tx.clone();
+    // 写任务：从 mpsc channel 读取消息，写入 WebSocket（包括 pings 和用户消息）
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
-            if tx_clone.receiver_count() == 0 {
-                break;
-            }
-            let ping = WsMessage::Ping;
-            if let Ok(json) = serde_json::to_string(&ping) {
-                let msg = Message::Text(json.into());
-                if let Err(e) = write.send(msg).await {
-                    warn!("Failed to send ping: {}", e);
-                    break;
+            tokio::select! {
+                // 优先处理出站消息
+                msg = outbound_rx.recv() => {
+                    match msg {
+                        Some(ws_msg) => {
+                            if let Ok(json) = serde_json::to_string(&ws_msg) {
+                                if ws_write.send(Message::Text(json.into())).await.is_err() {
+                                    warn!("Failed to write message to WebSocket");
+                                    break;
+                                }
+                            }
+                        }
+                        None => {
+                            // Channel closed, stop writer
+                            break;
+                        }
+                    }
+                }
+                // 每 30 秒发送一次 Ping 心跳
+                _ = tokio::time::sleep(tokio::time::Duration::from_secs(30)) => {
+                    let ping = WsMessage::Ping;
+                    if let Ok(json) = serde_json::to_string(&ping) {
+                        if ws_write.send(Message::Text(json.into())).await.is_err() {
+                            warn!("Failed to send ping");
+                            break;
+                        }
+                    }
+                    *LAST_PING.write() = Some(chrono::Utc::now().timestamp_millis());
                 }
             }
-            *LAST_PING.write() = Some(chrono::Utc::now().timestamp_millis());
         }
     });
 
     // 消息接收主循环
     loop {
         tokio::select! {
-            msg = read.next() => {
+            msg = ws_read.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
                         debug!("Received: {}", text);
@@ -197,10 +246,20 @@ async fn run_websocket_client(relay_url: String, tx: broadcast::Sender<WsMessage
                             if let WsMessage::Pong = &ws_msg {
                                 *LAST_PING.write() = Some(chrono::Utc::now().timestamp_millis());
                             }
-                            // 收到聊天消息：存入数据库并通知前端
+                            // 处理收到的聊天消息
                             if let WsMessage::ChatMessage { event_id, from, to, payload, media_id, timestamp, signature } = &ws_msg {
-                                info!("New chat message: {} -> {} (event_id: {})", from, to, event_id);
                                 let app_state = app_handle.state::<crate::AppState>();
+                                let my_pubkey = {
+                                    let identity = app_state.identity.read();
+                                    identity.get_public_key().map(|s| s.to_string()).unwrap_or_default()
+                                };
+                                // 忽略发送给其他人后的回显（from=me 且 to!=me）
+                                // 但自己发给自己的消息需要处理（from=me 且 to=me）
+                                if from == &my_pubkey && *to != my_pubkey {
+                                    debug!("Ignoring echo of own message: {}", event_id);
+                                    continue;
+                                }
+                                info!("New chat message: {} -> {} (event_id: {})", from, to, event_id);
                                 let db = app_state.db.lock().unwrap();
                                 let msg = DbMessage {
                                     id: uuid::Uuid::new_v4().to_string(),
@@ -231,12 +290,6 @@ async fn run_websocket_client(relay_url: String, tx: broadcast::Sender<WsMessage
                                 }
                                 let _ = app_handle.emit("message_recalled", ref_event_id);
                             }
-                            // 广播消息给所有订阅者
-                            if tx.receiver_count() > 0 {
-                                if let Err(e) = tx.send(ws_msg) {
-                                    warn!("Failed to broadcast: {}", e);
-                                }
-                            }
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => {
@@ -265,10 +318,8 @@ async fn run_websocket_client(relay_url: String, tx: broadcast::Sender<WsMessage
     // 清理连接状态
     *CLIENT_STATE.write() = ConnectionState::Disconnected;
     CONNECTED.store(false, Ordering::SeqCst);
-    *MESSAGE_TX.write() = None;
+    *OUTBOUND_TX.write() = None;
     info!("WebSocket client stopped");
-
-    Ok(())
 }
 
 /// 断开与 Relay 服务器的连接
@@ -280,7 +331,7 @@ pub async fn disconnect() -> Result<(), Error> {
 
     *CLIENT_STATE.write() = ConnectionState::Disconnected;
     CONNECTED.store(false, Ordering::SeqCst);
-    *MESSAGE_TX.write() = None;
+    *OUTBOUND_TX.write() = None;
     *RELAY_URL.write() = None;
 
     info!("Disconnected from relay");
@@ -379,11 +430,13 @@ pub async fn send_chat_message(
         db.insert_pending(&pending)?;
     }
 
-    // 广播消息到 Relay
-    if let Some(tx) = MESSAGE_TX.read().as_ref() {
-        if let Err(e) = tx.send(ws_msg) {
+    // 发送消息到 Relay
+    if let Some(tx) = OUTBOUND_TX.read().as_ref() {
+        if let Err(e) = tx.try_send(ws_msg) {
             error!("Failed to send message: {}", e);
         }
+    } else {
+        error!("No outbound channel available");
     }
 
     debug!("Message queued: {}", json);
@@ -419,9 +472,9 @@ pub async fn send_ack(
         return Err(Error::Relay("Invalid message type".to_string()));
     };
 
-    // 广播 ACK 给订阅者
-    if let Some(tx) = MESSAGE_TX.read().as_ref() {
-        let _ = tx.send(ack);
+    // 发送 ACK 到 Relay
+    if let Some(tx) = OUTBOUND_TX.read().as_ref() {
+        let _ = tx.try_send(ack);
     }
 
     // 确认成功后从 pending 表删除（消息已确认，无需重试）
@@ -463,9 +516,9 @@ pub async fn send_recall(
         return Err(Error::Relay("Invalid message type".to_string()));
     };
 
-    // 广播 Recall 给订阅者
-    if let Some(tx) = MESSAGE_TX.read().as_ref() {
-        let _ = tx.send(recall.clone());
+    // 发送 Recall 到 Relay
+    if let Some(tx) = OUTBOUND_TX.read().as_ref() {
+        let _ = tx.try_send(recall.clone());
     }
 
     // 标记数据库中消息为已撤回

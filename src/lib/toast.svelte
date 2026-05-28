@@ -4,7 +4,7 @@
 
 <div class="toast-container">
   {#each getToasts() as toast (toast.id)}
-    <div class="toast toast-{toast.type}">
+    <div class="toast {toast.type}">
       {toast.message}
     </div>
   {/each}
