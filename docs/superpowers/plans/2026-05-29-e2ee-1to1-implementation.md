@@ -24,6 +24,8 @@
 | `src-tauri/Cargo.toml` | 新增 `zeroize` 依赖 |
 | `src/routes/+page.svelte` | 打开聊天时触发协商，SessionKey 就绪前禁用输入 |
 
+> **注意：** `message.rs` 中的 `send_message` 命令不在此计划中修改。当前 UI 使用 `relay.rs::send_chat_message` 作为主要发送路径。`message.rs::send_message` 保留为离线消息发送的备选路径，后续可单独接入加密。
+
 ---
 
 ### Task 1: 添加 zeroize 依赖并重命名函数
@@ -163,18 +165,14 @@ impl Drop for SessionState {
 }
 
 impl SessionState {
-    /// 创建新会话，生成临时密钥对
+    /// 创建新会话（不生成密钥，密钥在 initiate_key_exchange 时生成）
     pub fn new(peer_pubkey: String) -> Self {
-        let (ephemeral_pub, ephemeral_priv) = crypto::generate_x25519_keypair();
-        let mut privkey = [0u8; 32];
-        privkey.copy_from_slice(&ephemeral_priv);
-
         info!("Created new session for peer: {}", peer_pubkey);
 
         SessionState {
             status: SessionStatus::None,
             peer_static_pubkey: peer_pubkey,
-            my_ephemeral_privkey: privkey,
+            my_ephemeral_privkey: [0u8; 32],
             peer_ephemeral_pubkey: None,
             session_key: None,
             pending_plaintext: Vec::new(),
@@ -231,9 +229,6 @@ impl SessionState {
         self.status = SessionStatus::Active;
         info!("Session activated with peer: {}", self.peer_static_pubkey);
 
-        // 发送队列中的明文消息
-        self.flush_pending_plaintext();
-
         Ok(())
     }
 
@@ -246,10 +241,9 @@ impl SessionState {
         Ok(())
     }
 
-    /// 刷新队列（密钥就绪后加密并返回所有待发消息）
-    fn flush_pending_plaintext(&mut self) {
-        // 此方法在 confirm_session 中调用
-        // 实际加密和发送由调用方处理
+    /// 刷新队列（密钥就绪后返回所有待发消息，由调用方加密发送）
+    pub fn flush_pending_plaintext(&mut self) -> Vec<PendingPlaintext> {
+        std::mem::take(&mut self.pending_plaintext)
     }
 
     /// 获取并清空待发明文消息
@@ -416,6 +410,20 @@ pub async fn initiate_key_exchange(
 
     // 获取或创建会话
     let session = state.sessions.get_or_create(&peer_pubkey);
+
+    // 检查当前会话状态
+    {
+        let s = session.read();
+        if s.status == crate::session::SessionStatus::Active {
+            // 已建立会话，需要 Rekeying
+            info!("Session already active, initiating rekeying");
+        } else if s.status == crate::session::SessionStatus::WaitingForPeer
+            || s.status == crate::session::SessionStatus::WaitingForConfirm
+        {
+            // 正在协商中，拒绝重复发起
+            return Err(Error::Relay("Key exchange already in progress".to_string()));
+        }
+    }
 
     // 生成临时密钥对
     let (ephemeral_pub, ephemeral_priv) = crypto::generate_x25519_keypair();
@@ -606,9 +614,54 @@ if let WsMessage::KeyExchange { from, to, ephemeral_pubkey, signature, nonce, ti
         }
     }
 
-    // 回复 KeyExchange（如果尚未发送）
-    // 这里简化处理：收到对方 KeyExchange 后，如果我方尚未发送，则发送
-    // 实际应该检查状态机
+    // 检查是否需要回复 KeyExchange（双向协商）
+    {
+        let mut s = session.write();
+        if s.status == crate::session::SessionStatus::None {
+            // 我方尚未发送 KeyExchange，需要先发送
+            // 生成新的临时密钥对（因为我们之前没有生成）
+            let (my_ephemeral_pub, my_ephemeral_priv) = crypto::generate_x25519_keypair();
+            let my_ephemeral_pub_b64 = base64::engine::general_purpose::STANDARD.encode(&my_ephemeral_pub);
+
+            let mut nonce_bytes = [0u8; 32];
+            rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce_bytes);
+            let nonce_b64 = base64::engine::general_purpose::STANDARD.encode(&nonce_bytes);
+            let timestamp = chrono::Utc::now().timestamp();
+
+            let mut signed_data = Vec::new();
+            signed_data.extend_from_slice(&my_ephemeral_pub);
+            signed_data.extend_from_slice(my_pubkey.as_bytes());
+            signed_data.extend_from_slice(&nonce_bytes);
+            signed_data.extend_from_slice(&timestamp.to_le_bytes());
+
+            let my_privkey = {
+                let identity = app_state.identity.read();
+                identity.decrypt_private_key(&[0u8; 32])
+                    .map_err(|e| Error::Identity(e.to_string()))?
+            };
+            let my_signature = crypto::sign_data(&signed_data, &my_privkey)
+                .map_err(|e| Error::Crypto(e.to_string()))?;
+            let my_signature_b64 = base64::engine::general_purpose::STANDARD.encode(&my_signature);
+
+            s.my_ephemeral_privkey = my_ephemeral_priv;
+            s.status = crate::session::SessionStatus::WaitingForPeer;
+
+            drop(s);
+
+            // 发送 KeyExchange 回复
+            let key_exchange = WsMessage::KeyExchange {
+                from: my_pubkey.clone(),
+                to: from.clone(),
+                ephemeral_pubkey: my_ephemeral_pub_b64,
+                signature: my_signature_b64,
+                nonce: nonce_b64,
+                timestamp,
+            };
+            if let Some(tx) = OUTBOUND_TX.read().as_ref() {
+                let _ = tx.try_send(key_exchange);
+            }
+        }
+    }
 
     // 发送 KeyConfirm
     {
@@ -704,6 +757,67 @@ git commit -m "feat(e2ee): implement KeyExchange and KeyConfirm message handling
 
 ---
 
+### Task 5.5: 实现会话超时机制
+
+**Files:**
+- Modify: `src-tauri/src/relay.rs`
+
+- [ ] **Step 1: 在 initiate_key_exchange 中添加超时定时器**
+
+在 `initiate_key_exchange` 函数的末尾，发送 KeyExchange 后，启动超时定时器：
+
+```rust
+// 启动超时定时器（30秒）
+let app_handle_clone = state.app_handle.clone();
+let peer_clone = peer_pubkey.clone();
+let session_clone = session.clone();
+
+tokio::spawn(async move {
+    tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+    let mut s = session_clone.write();
+    if s.status == crate::session::SessionStatus::WaitingForPeer {
+        warn!("KeyExchange timeout for peer: {}", peer_clone);
+        s.status = crate::session::SessionStatus::None;
+        let _ = app_handle_clone.emit("session_timeout", &peer_clone);
+    }
+});
+```
+
+- [ ] **Step 2: 在 KeyConfirm 处理中添加超时定时器**
+
+在 Task 5 的 KeyConfirm 处理代码中，发送 KeyConfirm 后启动超时定时器：
+
+```rust
+// 启动 KeyConfirm 超时定时器（30秒）
+let app_handle_clone = app_handle.clone();
+let peer_clone = from.clone();
+let session_clone = session.clone();
+
+tokio::spawn(async move {
+    tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+    let mut s = session_clone.write();
+    if s.status == crate::session::SessionStatus::WaitingForConfirm {
+        warn!("KeyConfirm timeout for peer: {}", peer_clone);
+        s.status = crate::session::SessionStatus::None;
+        let _ = app_handle_clone.emit("session_timeout", &peer_clone);
+    }
+});
+```
+
+- [ ] **Step 3: 编译验证**
+
+Run: `cd src-tauri && cargo check`
+Expected: 编译通过
+
+- [ ] **Step 4: 提交**
+
+```bash
+git add src-tauri/src/relay.rs
+git commit -m "feat(e2ee): add session timeout mechanism for key exchange"
+```
+
+---
+
 ### Task 6: 修改消息发送路径 — 接入加密
 
 **Files:**
@@ -716,27 +830,54 @@ git commit -m "feat(e2ee): implement KeyExchange and KeyConfirm message handling
 ```rust
 // 检查会话状态
 let session = state.sessions.get(&to);
-let encrypted_payload = if let Some(session) = session {
+let (encrypted_payload, should_send_now) = if let Some(session) = session {
     let s = session.read();
     if s.status == crate::session::SessionStatus::Active {
         // 会话已建立，加密消息
         match s.encrypt(payload.as_bytes()) {
-            Ok(enc) => base64::engine::general_purpose::STANDARD.encode(&enc),
+            Ok(enc) => (base64::engine::general_purpose::STANDARD.encode(&enc), true),
             Err(e) => {
-                warn!("Encryption failed, sending plaintext: {}", e);
-                payload.clone()
+                warn!("Encryption failed: {}", e);
+                return Err(Error::Crypto(e));
             }
         }
     } else {
-        // 会话未建立，发送明文（降级）
-        warn!("Session not active, sending plaintext");
-        payload.clone()
+        // 会话未建立，加入明文队列
+        warn!("Session not active, queueing message");
+        (payload.clone(), false)
     }
 } else {
-    // 无会话，发送明文（降级）
-    warn!("No session found, sending plaintext");
-    payload.clone()
+    // 无会话，加入明文队列
+    warn!("No session found, queueing message");
+    (payload.clone(), false)
 };
+
+// 如果未就绪，加入明文队列
+if !should_send_now {
+    if let Some(session) = &session {
+        let mut s = session.write();
+        let pending = crate::session::PendingPlaintext {
+            event_id: event_id.clone(),
+            to_recipient: to.clone(),
+            payload: payload.clone(),
+            seq_id,
+            created_at: timestamp,
+        };
+        if let Err(e) = s.enqueue_plaintext(pending) {
+            warn!("Failed to queue message: {}", e);
+            return Err(Error::Relay(e));
+        }
+        // 消息已加入队列，不立即发送
+        // 存入数据库（标记为未发送）
+        let db_msg = DbMessage {
+            // ...
+            payload: payload.clone(),  // 存明文以便后续加密
+            // ...
+        };
+        // ... 插入数据库
+        return Ok(event_id);
+    }
+}
 
 // 使用加密后的 payload 进行签名
 let signature_data = format!("{}{}{}{}", event_id, from_pubkey, encrypted_payload, seq_id);
@@ -802,47 +943,74 @@ if let WsMessage::ChatMessage { event_id, from, to, payload, media_id, timestamp
         continue;
     }
 
+    // 验证签名
+    let seq_id = {
+        let db = app_state.db.lock().unwrap();
+        db.get_next_seq_id(to).unwrap_or(0)
+    };
+    let signature_data = format!("{}{}{}{}", event_id, from, payload, seq_id);
+    if let Ok(from_pubkey_bytes) = base64::engine::general_purpose::STANDARD.decode(from) {
+        if let Ok(sig_bytes) = base64::engine::general_purpose::STANDARD.decode(signature) {
+            let valid = crypto::verify_signature(signature_data.as_bytes(), &sig_bytes, &from_pubkey_bytes)
+                .unwrap_or(false);
+            if !valid {
+                warn!("Invalid message signature from {}", from);
+                continue;
+            }
+        }
+    }
+
     // 尝试解密
-    let decrypted_payload = if let Some(session) = app_state.sessions.get(from) {
+    let (decrypted_for_display, stored_payload) = if let Some(session) = app_state.sessions.get(from) {
         let s = session.read();
         if s.status == crate::session::SessionStatus::Active {
             if let Ok(cipher_bytes) = base64::engine::general_purpose::STANDARD.decode(payload) {
                 match s.decrypt(&cipher_bytes) {
-                    Ok(plaintext) => String::from_utf8_lossy(&plaintext).to_string(),
+                    Ok(plaintext) => {
+                        let display = String::from_utf8_lossy(&plaintext).to_string();
+                        (display, payload.clone())  // 数据库存密文
+                    }
                     Err(e) => {
                         warn!("Decryption failed from {}: {}", from, e);
-                        "[解密失败]".to_string()
+                        ("[解密失败]".to_string(), payload.clone())
                     }
                 }
             } else {
-                payload.clone()
+                (payload.clone(), payload.clone())
             }
         } else {
-            payload.clone()
+            (payload.clone(), payload.clone())
         }
     } else {
-        payload.clone()
+        (payload.clone(), payload.clone())
     };
 
     info!("New chat message: {} -> {} (event_id: {})", from, to, event_id);
 
     let db = app_state.db.lock().unwrap();
     let msg = DbMessage {
-        // ...
-        payload: decrypted_payload.clone(),
-        // ...
+        id: uuid::Uuid::new_v4().to_string(),
+        event_id: event_id.clone(),
+        msg_type: "text".to_string(),
+        from_pubkey: from.clone(),
+        to_recipient: to.clone(),
+        payload: stored_payload,  // 数据库存储密文
+        media_id: media_id.clone(),
+        timestamp: *timestamp,
+        seq_id,
+        signature: signature.clone(),
+        delivered: true,
+        recalled: false,
     };
-
-    // 存入数据库（存储明文，因为已经解密了）
-    // 注意：这与设计文档有差异。设计文档说存储密文。
-    // 但为了简单起见，先存储解密后的明文。
-    // 后续可以改为存储密文 + 在前端解密。
 
     if let Err(e) = db.insert_message(&msg) {
         error!("Failed to store message: {}", e);
     }
 
-    let _ = app_handle.emit("new_message", &msg);
+    // 通知前端时使用解密后的明文
+    let mut display_msg = msg.clone();
+    display_msg.payload = decrypted_for_display;
+    let _ = app_handle.emit("new_message", &display_msg);
 }
 ```
 
@@ -1006,6 +1174,42 @@ Expected: 编译通过
 ```bash
 git add src/routes/+page.svelte
 git commit -m "feat(e2ee): add key exchange UI flow and session status display"
+```
+
+---
+
+### Task 8.5: 监听会话超时事件
+
+**Files:**
+- Modify: `src/routes/+page.svelte`
+
+- [ ] **Step 1: 添加超时事件监听**
+
+在 `onMount` 中添加对 `session_timeout` 事件的监听：
+
+```javascript
+// 订阅会话超时事件
+const unlistenTimeout = await listen('session_timeout', (event) => {
+  const peerPubkey = event.payload;
+  if (currentContact && currentContact.pubkey === peerPubkey) {
+    sessionStatus = 'Timeout';
+    showToast('密钥协商超时，请重试');
+  }
+});
+
+return () => {
+  unlistenNewMsg();
+  unlistenRecall();
+  unlistenTimeout();
+  clearInterval(refreshInterval);
+};
+```
+
+- [ ] **Step 2: 提交**
+
+```bash
+git add src/routes/+page.svelte
+git commit -m "feat(e2ee): listen for session timeout events"
 ```
 
 ---
