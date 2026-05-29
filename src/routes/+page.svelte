@@ -13,6 +13,7 @@
   let isConnected = $state(false);
   let myPubkey = $state('');
   let myNickname = $state('');
+  let sessionStatus = $state('None');
 
   onMount(async () => {
     // 获取我的公钥和昵称
@@ -63,9 +64,19 @@
       }
     }, 15000);
 
+    // 订阅会话超时事件
+    const unlistenTimeout = await listen('session_timeout', (event) => {
+      const peerPubkey = event.payload;
+      if (currentContact && currentContact.pubkey === peerPubkey) {
+        sessionStatus = 'Timeout';
+        showToast('密钥协商超时，请重试');
+      }
+    });
+
     return () => {
       unlistenNewMsg();
       unlistenRecall();
+      unlistenTimeout();
       clearInterval(refreshInterval);
     };
   });
@@ -123,6 +134,12 @@
   async function sendMessage() {
     if (!inputMessage.trim() || !currentContact) return;
 
+    // 检查会话状态
+    if (sessionStatus !== 'Active') {
+      showToast('安全通道尚未建立，请稍候...');
+      return;
+    }
+
     try {
       const result = await invoke('send_chat_message', {
         to: currentContact.pubkey,
@@ -151,7 +168,38 @@
 
   async function selectContact(contact) {
     currentContact = contact;
+    sessionStatus = 'None';
     await loadChat(contact.pubkey);
+
+    // 发起密钥协商
+    try {
+      console.log('Initiating key exchange with:', contact.pubkey);
+      await invoke('initiate_key_exchange', { peerPubkey: contact.pubkey });
+      console.log('Key exchange initiated successfully');
+      // 轮询会话状态
+      const pollInterval = setInterval(async () => {
+        try {
+          const status = await invoke('get_session_status', { peerPubkey: contact.pubkey });
+          console.log('Session status:', status);
+          sessionStatus = status;
+          if (status === 'Active') {
+            clearInterval(pollInterval);
+          }
+        } catch (e) {
+          console.error('Failed to get session status:', e);
+        }
+      }, 1000);
+
+      // 30秒超时
+      setTimeout(() => {
+        clearInterval(pollInterval);
+        if (sessionStatus !== 'Active') {
+          sessionStatus = 'Timeout';
+        }
+      }, 30000);
+    } catch (e) {
+      console.error('Failed to initiate key exchange:', e);
+    }
   }
 
   async function loadChat(peerPubkey) {
@@ -271,14 +319,28 @@
         </div>
 
         <div class="chat-input-area">
+          {#if sessionStatus !== 'Active'}
+            <div class="session-status-bar">
+              {#if sessionStatus === 'None' || sessionStatus === 'WaitingForPeer'}
+                正在建立安全通道...
+              {:else if sessionStatus === 'Timeout'}
+                密钥协商失败
+                <button onclick={() => selectContact(currentContact)}>重试</button>
+              {:else}
+                正在确认密钥...
+              {/if}
+            </div>
+          {/if}
+
           <textarea
             bind:value={inputMessage}
             onkeydown={handleKeydown}
-            placeholder="Type a message..."
+            placeholder={sessionStatus === 'Active' ? 'Type a message...' : 'Waiting for secure channel...'}
             class="chat-input"
             rows="1"
+            disabled={sessionStatus !== 'Active'}
           ></textarea>
-          <button class="btn-send" onclick={sendMessage} disabled={!inputMessage.trim()}>
+          <button class="btn-send" onclick={sendMessage} disabled={!inputMessage.trim() || sessionStatus !== 'Active'}>
             Send
           </button>
         </div>
@@ -644,10 +706,33 @@
 
   .chat-input-area {
     display: flex;
+    flex-direction: column;
     padding: 1rem 1.5rem;
     background: #161b22;
     border-top: 1px solid #30363d;
     gap: 0.75rem;
+  }
+
+  .session-status-bar {
+    padding: 0.5rem 1rem;
+    background: #1c2128;
+    border-bottom: 1px solid #30363d;
+    font-size: 0.85rem;
+    color: #d29922;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    border-radius: 6px;
+  }
+
+  .session-status-bar button {
+    padding: 0.2rem 0.5rem;
+    border: 1px solid #30363d;
+    border-radius: 4px;
+    background: #21262d;
+    color: #e6edf3;
+    cursor: pointer;
+    font-size: 0.8rem;
   }
 
   .chat-input {

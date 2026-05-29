@@ -268,3 +268,227 @@ pub fn cmd_generate_x25519_keypair() -> Result<(String, String), Error> {
         base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &privkey),
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========== 密钥生成 ==========
+
+    #[test]
+    fn test_generate_identity_keypair() {
+        let (pubkey, privkey) = generate_identity_keypair();
+        assert_eq!(pubkey.len(), 32);
+        assert_eq!(privkey.len(), 32);
+        assert_ne!(pubkey, privkey);
+    }
+
+    #[test]
+    fn test_generate_x25519_keypair() {
+        let (pubkey, privkey) = generate_x25519_keypair();
+        assert_eq!(pubkey.len(), 32);
+        assert_eq!(privkey.len(), 32);
+        assert_ne!(pubkey, privkey);
+    }
+
+    #[test]
+    fn test_generate_x25519_keypair_unique() {
+        let (pub1, _) = generate_x25519_keypair();
+        let (pub2, _) = generate_x25519_keypair();
+        assert_ne!(pub1, pub2);
+    }
+
+    // ========== 密钥协商 ==========
+
+    #[test]
+    fn test_derive_session_key_deterministic() {
+        let (pub_a, priv_a) = generate_x25519_keypair();
+        let (pub_b, priv_b) = generate_x25519_keypair();
+
+        // Alice 用 Alice私钥 + Bob公钥
+        let key1 = derive_session_key(&priv_a, &pub_b, b"test").unwrap();
+        // Bob 用 Bob私钥 + Alice公钥
+        let key2 = derive_session_key(&priv_b, &pub_a, b"test").unwrap();
+
+        // ECDH 保证双方派生出相同密钥
+        assert_eq!(key1, key2);
+    }
+
+    #[test]
+    fn test_derive_session_key_different_info() {
+        let (_pub_a, priv_a) = generate_x25519_keypair();
+        let (pub_b, _) = generate_x25519_keypair();
+
+        let key1 = derive_session_key(&priv_a, &pub_b, b"info1").unwrap();
+        let key2 = derive_session_key(&priv_a, &pub_b, b"info2").unwrap();
+        assert_ne!(key1, key2);
+    }
+
+    // ========== 加密解密 ==========
+
+    #[test]
+    fn test_encrypt_decrypt_roundtrip() {
+        let key = vec![0u8; 32];
+        let plaintext = b"Hello, World!";
+        let ciphertext = encrypt_message(plaintext, &key, None).unwrap();
+        assert_ne!(ciphertext, plaintext);
+        let decrypted = decrypt_message(&ciphertext, &key, None).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_with_aad() {
+        let key = vec![0u8; 32];
+        let aad = b"additional data";
+        let plaintext = b"Secret message";
+        let ciphertext = encrypt_message(plaintext, &key, Some(aad)).unwrap();
+        let decrypted = decrypt_message(&ciphertext, &key, Some(aad)).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_decrypt_with_wrong_key_fails() {
+        let key1 = vec![0u8; 32];
+        let key2 = vec![1u8; 32];
+        let ciphertext = encrypt_message(b"secret", &key1, None).unwrap();
+        assert!(decrypt_message(&ciphertext, &key2, None).is_err());
+    }
+
+    #[test]
+    fn test_aad_ignored_in_current_impl() {
+        // 当前实现中 AAD 未实际使用（参数为 _aad）
+        // 解密时传入不同 AAD 仍能成功
+        let key = vec![0u8; 32];
+        let ciphertext = encrypt_message(b"secret", &key, Some(b"aad1")).unwrap();
+        assert!(decrypt_message(&ciphertext, &key, Some(b"aad2")).is_ok());
+    }
+
+    #[test]
+    fn test_decrypt_too_short_ciphertext() {
+        let key = vec![0u8; 32];
+        assert!(decrypt_message(&[0u8; 5], &key, None).is_err());
+    }
+
+    #[test]
+    fn test_encrypt_produces_different_ciphertext_each_time() {
+        let key = vec![0u8; 32];
+        let ct1 = encrypt_message(b"same", &key, None).unwrap();
+        let ct2 = encrypt_message(b"same", &key, None).unwrap();
+        // 随机 nonce 导致每次密文不同
+        assert_ne!(ct1, ct2);
+    }
+
+    // ========== 签名验证 ==========
+
+    #[test]
+    fn test_sign_and_verify() {
+        let (pubkey, privkey) = generate_identity_keypair();
+        let data = b"message to sign";
+        let signature = sign_data(data, &privkey).unwrap();
+        assert!(verify_signature(data, &signature, &pubkey).unwrap());
+    }
+
+    #[test]
+    fn test_verify_wrong_data_fails() {
+        let (pubkey, privkey) = generate_identity_keypair();
+        let signature = sign_data(b"original", &privkey).unwrap();
+        assert!(!verify_signature(b"tampered", &signature, &pubkey).unwrap());
+    }
+
+    #[test]
+    fn test_verify_wrong_key_fails() {
+        let (_, privkey) = generate_identity_keypair();
+        let (other_pubkey, _) = generate_identity_keypair();
+        let signature = sign_data(b"message", &privkey).unwrap();
+        assert!(!verify_signature(b"message", &signature, &other_pubkey).unwrap());
+    }
+
+    #[test]
+    fn test_sign_invalid_key_length() {
+        assert!(sign_data(b"data", &[0u8; 16]).is_err());
+    }
+
+    #[test]
+    fn test_verify_invalid_signature_length() {
+        let (pubkey, _) = generate_identity_keypair();
+        assert!(verify_signature(b"data", &[0u8; 32], &pubkey).is_err());
+    }
+
+    // ========== 哈希 ==========
+
+    #[test]
+    fn test_hash_data() {
+        let h1 = hash_data(b"hello");
+        let h2 = hash_data(b"hello");
+        assert_eq!(h1, h2);
+        assert_eq!(h1.len(), 32);
+    }
+
+    #[test]
+    fn test_hash_data_different_input() {
+        let h1 = hash_data(b"hello");
+        let h2 = hash_data(b"world");
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn test_blake3_hash() {
+        let h1 = blake3_hash(b"hello");
+        let h2 = blake3_hash(b"hello");
+        assert_eq!(h1, h2);
+        assert_eq!(h1.len(), 32);
+    }
+
+    #[test]
+    fn test_blake3_keyed_hash() {
+        let key = vec![0u8; 32];
+        let h1 = blake3_keyed_hash(b"hello", &key);
+        let h2 = blake3_keyed_hash(b"hello", &key);
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn test_blake3_keyed_hash_different_key() {
+        let key1 = vec![0u8; 32];
+        let key2 = vec![1u8; 32];
+        let h1 = blake3_keyed_hash(b"hello", &key1);
+        let h2 = blake3_keyed_hash(b"hello", &key2);
+        assert_ne!(h1, h2);
+    }
+
+    // ========== E2EE 完整流程 ==========
+
+    #[test]
+    fn test_e2ee_full_flow() {
+        // 模拟完整的 E2EE 流程
+        let info = b"decentralized-im-e2ee-1to1";
+
+        // 1. 双方生成临时密钥对
+        let (alice_ephemeral_pub, alice_ephemeral_priv) = generate_x25519_keypair();
+        let (bob_ephemeral_pub, bob_ephemeral_priv) = generate_x25519_keypair();
+
+        // 2. 双方通过 ECDH + HKDF 派生相同的会话密钥
+        let alice_key = derive_session_key(&alice_ephemeral_priv, &bob_ephemeral_pub, info).unwrap();
+        let bob_key = derive_session_key(&bob_ephemeral_priv, &alice_ephemeral_pub, info).unwrap();
+        assert_eq!(alice_key, bob_key, "Session keys must match");
+
+        // 3. Alice 签署她的临时公钥，Bob 验证
+        let (alice_id_pub, alice_id_priv) = generate_identity_keypair();
+        let alice_signed = sign_data(&alice_ephemeral_pub, &alice_id_priv).unwrap();
+        assert!(verify_signature(&alice_ephemeral_pub, &alice_signed, &alice_id_pub).unwrap());
+
+        // 4. Alice 加密消息
+        let plaintext = b"Hello Bob, this is secret!";
+        let ciphertext = encrypt_message(plaintext, &alice_key, None).unwrap();
+
+        // 5. Bob 解密消息
+        let decrypted = decrypt_message(&ciphertext, &bob_key, None).unwrap();
+        assert_eq!(decrypted, plaintext);
+
+        // 6. Bob 回复
+        let reply = b"Hi Alice, got your message!";
+        let reply_ct = encrypt_message(reply, &bob_key, None).unwrap();
+        let reply_pt = decrypt_message(&reply_ct, &alice_key, None).unwrap();
+        assert_eq!(reply_pt, reply);
+    }
+}

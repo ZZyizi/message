@@ -602,6 +602,20 @@ impl Database {
         Ok(())
     }
 
+    /// 更新消息的 payload 和 signature（用于将明文替换为密文并更新签名）
+    pub fn update_message_payload_and_signature(
+        &self,
+        event_id: &str,
+        new_payload: &str,
+        new_signature: &str,
+    ) -> Result<(), Error> {
+        self.conn.execute(
+            "UPDATE messages SET payload = ?1, signature = ?2 WHERE event_id = ?3",
+            params![new_payload, new_signature, event_id],
+        )?;
+        Ok(())
+    }
+
     /// 获取设置值
     pub fn get_setting(&self, key: &str) -> Result<Option<String>, Error> {
         let mut stmt = self.conn.prepare("SELECT value FROM settings WHERE key = ?1")?;
@@ -609,5 +623,180 @@ impl Database {
             .query_row(params![key], |row| row.get(0))
             .optional()?;
         Ok(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn test_db() -> Database {
+        let db = Database::new(Path::new(":memory:")).unwrap();
+        db
+    }
+
+    fn test_msg(event_id: &str, from: &str, to: &str, payload: &str) -> Message {
+        Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            event_id: event_id.to_string(),
+            msg_type: "text".to_string(),
+            from_pubkey: from.to_string(),
+            to_recipient: to.to_string(),
+            payload: payload.to_string(),
+            media_id: None,
+            timestamp: 1000,
+            seq_id: 1,
+            signature: "sig".to_string(),
+            delivered: false,
+            recalled: false,
+        }
+    }
+
+    #[test]
+    fn test_insert_and_get_message() {
+        let db = test_db();
+        let msg = test_msg("evt1", "alice", "bob", "hello");
+        db.insert_message(&msg).unwrap();
+        let msgs = db.get_messages("bob", None, 10).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].payload, "hello");
+    }
+
+    #[test]
+    fn test_update_message_payload_and_signature() {
+        let db = test_db();
+        let msg = test_msg("evt1", "alice", "bob", "plaintext");
+        db.insert_message(&msg).unwrap();
+
+        // 更新为密文和新签名
+        db.update_message_payload_and_signature("evt1", "ciphertext", "new_sig").unwrap();
+
+        let msgs = db.get_messages("bob", None, 10).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].payload, "ciphertext");
+        assert_eq!(msgs[0].signature, "new_sig");
+    }
+
+    #[test]
+    fn test_update_nonexistent_message() {
+        let db = test_db();
+        // 不存在的 event_id 不应报错，只是更新 0 行
+        db.update_message_payload_and_signature("nonexistent", "payload", "sig").unwrap();
+    }
+
+    #[test]
+    fn test_mark_delivered() {
+        let db = test_db();
+        let msg = test_msg("evt1", "alice", "bob", "hello");
+        db.insert_message(&msg).unwrap();
+        db.mark_message_delivered("evt1").unwrap();
+        let msgs = db.get_messages("bob", None, 10).unwrap();
+        assert!(msgs[0].delivered);
+    }
+
+    #[test]
+    fn test_mark_recalled() {
+        let db = test_db();
+        let msg = test_msg("evt1", "alice", "bob", "hello");
+        db.insert_message(&msg).unwrap();
+        db.mark_message_recalled("evt1").unwrap();
+        let msgs = db.get_messages("bob", None, 10).unwrap();
+        assert!(msgs.is_empty()); // 被撤回的消息不返回
+    }
+
+    #[test]
+    fn test_get_next_seq_id() {
+        let db = test_db();
+        assert_eq!(db.get_next_seq_id("bob").unwrap(), 1);
+
+        let mut msg = test_msg("evt1", "alice", "bob", "hello");
+        msg.seq_id = 5;
+        db.insert_message(&msg).unwrap();
+        assert_eq!(db.get_next_seq_id("bob").unwrap(), 6);
+    }
+
+    #[test]
+    fn test_pending_messages() {
+        let db = test_db();
+        let pending = PendingMessage {
+            id: "p1".to_string(),
+            event_id: "evt1".to_string(),
+            to_recipient: "bob".to_string(),
+            payload: "{}".to_string(),
+            created_at: 1000,
+            retry_count: 0,
+        };
+        db.insert_pending(&pending).unwrap();
+        let msgs = db.get_pending_messages(10).unwrap();
+        assert_eq!(msgs.len(), 1);
+
+        db.delete_pending("evt1").unwrap();
+        let msgs = db.get_pending_messages(10).unwrap();
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn test_settings() {
+        let db = test_db();
+        db.set_setting("relay_url", "ws://localhost:8080").unwrap();
+        let val = db.get_setting("relay_url").unwrap();
+        assert_eq!(val, Some("ws://localhost:8080".to_string()));
+
+        db.set_setting("relay_url", "ws://other:9090").unwrap();
+        let val = db.get_setting("relay_url").unwrap();
+        assert_eq!(val, Some("ws://other:9090".to_string()));
+    }
+
+    #[test]
+    fn test_contacts() {
+        let db = test_db();
+        db.upsert_contact("pk1", None).unwrap();
+        let contacts = db.get_contacts().unwrap();
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].pubkey, "pk1");
+
+        // 重复插入不应报错
+        db.upsert_contact("pk1", None).unwrap();
+        let contacts = db.get_contacts().unwrap();
+        assert_eq!(contacts.len(), 1);
+
+        db.delete_contact("pk1").unwrap();
+        let contacts = db.get_contacts().unwrap();
+        assert!(contacts.is_empty());
+    }
+
+    #[test]
+    fn test_identity() {
+        let db = test_db();
+        db.save_identity("pub1", "enc_priv1").unwrap();
+        let (pubkey, enc_priv) = db.get_identity().unwrap().unwrap();
+        assert_eq!(pubkey, "pub1");
+        assert_eq!(enc_priv, "enc_priv1");
+    }
+
+    #[test]
+    fn test_group_operations() {
+        let db = test_db();
+        let group = Group {
+            id: "g1".to_string(),
+            name: "Test Group".to_string(),
+            owner_pubkey: "alice".to_string(),
+            created_at: 1000,
+            group_key_id: "key1".to_string(),
+        };
+        db.insert_group(&group).unwrap();
+
+        let g = db.get_group("g1").unwrap().unwrap();
+        assert_eq!(g.name, "Test Group");
+
+        db.add_group_member("g1", "alice", "owner").unwrap();
+        db.add_group_member("g1", "bob", "member").unwrap();
+        let members = db.get_group_members("g1").unwrap();
+        assert_eq!(members.len(), 2);
+
+        db.remove_group_member("g1", "bob").unwrap();
+        let members = db.get_group_members("g1").unwrap();
+        assert_eq!(members.len(), 1);
     }
 }

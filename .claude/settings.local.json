@@ -44,7 +44,11 @@
       "Bash(taskkill //F //IM decentralized-im.exe)",
       "mcp__codegraph__codegraph_context",
       "Bash(cmd.exe /c \"where npm\")",
-      "Bash(cmd.exe /c \"node -v\")"
+      "Bash(cmd.exe /c \"node -v\")",
+      "mcp__codegraph__codegraph_files",
+      "mcp__codegraph__codegraph_explore",
+      "Bash(bash test-e2ee.sh)",
+      "Bash(cargo test *)"
     ]
   }
 }

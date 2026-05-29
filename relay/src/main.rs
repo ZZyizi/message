@@ -65,8 +65,6 @@ pub enum WsMessage {
 
 /// 在线客户端会话
 struct ClientSession {
-    /// 客户端公钥
-    pubkey: String,
     /// WebSocket 发送通道
     tx: broadcast::Sender<WsMessage>,
 }
@@ -137,7 +135,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, pubkey: String) 
     // 注册客户端（如果已有连接则替换）
     {
         let mut clients = state.clients.write();
-        clients.insert(pubkey.clone(), Arc::new(ClientSession { pubkey: pubkey.clone(), tx }));
+        clients.insert(pubkey.clone(), Arc::new(ClientSession { tx }));
     }
 
     let (mut sender, mut receiver) = socket.split();
