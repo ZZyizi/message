@@ -14,6 +14,7 @@ mod error;      // 统一错误类型
 mod identity;  // 身份密钥管理
 mod message;    // 消息收发
 mod relay;     // 中继服务器连接
+mod session;   // E2EE 会话状态管理
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -38,6 +39,8 @@ pub struct AppState {
     pub identity: Arc<RwLock<identity::IdentityManager>>,
     /// Tauri 应用句柄
     pub app_handle: tauri::AppHandle,
+    /// E2EE 会话管理器
+    pub sessions: session::SessionManager,
 }
 
 /// 初始化日志系统
@@ -118,6 +121,7 @@ pub fn run() {
                 identity_db: Arc::new(Mutex::new(identity_db)),
                 identity: Arc::new(RwLock::new(identity)),
                 app_handle: app.handle().clone(),
+                sessions: session::SessionManager::new(),
             };
 
             app.manage(state);
