@@ -138,7 +138,12 @@ impl SessionState {
     }
 
     /// 加入等待密钥的明文消息队列
+    ///
+    /// 仅在 WaitingForPeer 或 KeyExchanged 状态下允许入队
     pub fn enqueue_plaintext(&mut self, msg: PendingPlaintext) -> Result<(), String> {
+        if self.status != SessionStatus::WaitingForPeer && self.status != SessionStatus::KeyExchanged {
+            return Err(format!("Cannot enqueue in status: {:?}", self.status));
+        }
         if self.pending_plaintext.len() >= MAX_PENDING_PLAINTEXT {
             return Err("Pending plaintext queue full".to_string());
         }
