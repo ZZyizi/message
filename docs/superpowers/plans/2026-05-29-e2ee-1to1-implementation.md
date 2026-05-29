@@ -727,14 +727,15 @@ if let WsMessage::KeyExchange { from, to, ephemeral_pubkey, signature, nonce, ti
                                         media_id: None,
                                         timestamp: p.created_at,
                                         signature: sig_b64,
+                                        seq_id: p.seq_id,
                                     };
                                     if let Some(tx) = OUTBOUND_TX.read().as_ref() {
                                         let _ = tx.try_send(ws_msg);
                                     }
 
-                                    // 更新数据库：将明文替换为密文
+                                    // 更新数据库：将明文替换为密文并更新签名
                                     let db = app_state.db.lock().unwrap();
-                                    let _ = db.update_message_payload(&p.event_id, &enc_b64);
+                                    let _ = db.update_message_payload_and_signature(&p.event_id, &enc_b64, &sig_b64);
                                 }
                             }
                         }
@@ -805,12 +806,13 @@ if let WsMessage::KeyConfirm { from, to, encrypted_confirm } = &ws_msg {
                                     media_id: None,
                                     timestamp: p.created_at,
                                     signature: sig_b64,
+                                    seq_id: p.seq_id,
                                 };
                                 if let Some(tx) = OUTBOUND_TX.read().as_ref() {
                                     let _ = tx.try_send(ws_msg);
                                 }
                                 let db = app_state.db.lock().unwrap();
-                                let _ = db.update_message_payload(&p.event_id, &enc_b64);
+                                let _ = db.update_message_payload_and_signature(&p.event_id, &enc_b64, &sig_b64);
                             }
                         }
                     }
@@ -910,16 +912,21 @@ git commit -m "feat(e2ee): add session timeout mechanism for key exchange"
 - Modify: `src-tauri/src/db.rs`
 - Modify: `src-tauri/src/relay.rs`
 
-- [ ] **Step 1: 在 db.rs 中添加 update_message_payload 方法**
+- [ ] **Step 1: 在 db.rs 中添加 update_message_payload_and_signature 方法**
 
 在 `Database` 实现中添加：
 
 ```rust
-/// 更新消息的 payload（用于将明文替换为密文）
-pub fn update_message_payload(&self, event_id: &str, new_payload: &str) -> Result<(), Error> {
+/// 更新消息的 payload 和 signature（用于将明文替换为密文并更新签名）
+pub fn update_message_payload_and_signature(
+    &self,
+    event_id: &str,
+    new_payload: &str,
+    new_signature: &str,
+) -> Result<(), Error> {
     self.conn.execute(
-        "UPDATE messages SET payload = ?1 WHERE event_id = ?2",
-        rusqlite::params![new_payload, event_id],
+        "UPDATE messages SET payload = ?1, signature = ?2 WHERE event_id = ?3",
+        rusqlite::params![new_payload, new_signature, event_id],
     )?;
     Ok(())
 }
@@ -966,9 +973,9 @@ git commit -m "feat(e2ee): add update_message_payload and include seq_id in Chat
 在 `relay.rs` 的 `send_chat_message` 函数中，在签名之前添加加密步骤：
 
 ```rust
-// 检查会话状态
-let session = state.sessions.get(&to);
-let (encrypted_payload, should_send_now) = if let Some(session) = session {
+// 检查会话状态（如果不存在则创建）
+let session = state.sessions.get_or_create(&to);
+let (encrypted_payload, should_send_now) = {
     let s = session.read();
     if s.status == crate::session::SessionStatus::Active {
         // 会话已建立，加密消息
@@ -984,27 +991,22 @@ let (encrypted_payload, should_send_now) = if let Some(session) = session {
         warn!("Session not active, queueing message");
         (payload.clone(), false)
     }
-} else {
-    // 无会话，加入明文队列
-    warn!("No session found, queueing message");
-    (payload.clone(), false)
 };
 
 // 如果未就绪，加入明文队列
 if !should_send_now {
-    if let Some(session) = &session {
-        let mut s = session.write();
-        let pending = crate::session::PendingPlaintext {
-            event_id: event_id.clone(),
-            to_recipient: to.clone(),
-            payload: payload.clone(),
-            seq_id,
-            created_at: timestamp,
-        };
-        if let Err(e) = s.enqueue_plaintext(pending) {
-            warn!("Failed to queue message: {}", e);
-            return Err(Error::Relay(e));
-        }
+    let mut s = session.write();
+    let pending = crate::session::PendingPlaintext {
+        event_id: event_id.clone(),
+        to_recipient: to.clone(),
+        payload: payload.clone(),
+        seq_id,
+        created_at: timestamp,
+    };
+    if let Err(e) = s.enqueue_plaintext(pending) {
+        warn!("Failed to queue message: {}", e);
+        return Err(Error::Relay(e));
+    }
         // 消息已加入队列，不立即发送
         // 存入数据库（标记为未发送）
         let db_msg = DbMessage {
