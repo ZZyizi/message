@@ -597,3 +597,84 @@ pub async fn fetch_online_users() -> Result<Vec<String>, Error> {
 pub async fn get_online_users() -> Result<Vec<String>, Error> {
     fetch_online_users().await
 }
+
+/// 发起密钥协商
+///
+/// 生成临时密钥对，用 Ed25519 私钥对复合值签名后通过 Relay 发送给对方
+#[tauri::command]
+pub async fn initiate_key_exchange(
+    peer_pubkey: String,
+    state: tauri::State<'_, crate::AppState>,
+) -> Result<(), Error> {
+    if *CLIENT_STATE.read() != ConnectionState::Connected {
+        return Err(Error::Relay("Not connected to relay".to_string()));
+    }
+
+    let identity = state.identity.read();
+    let from_pubkey = identity.get_public_key()
+        .ok_or_else(|| Error::Identity("No identity found".to_string()))?
+        .to_string();
+
+    // 获取或创建会话并生成临时密钥
+    let session = state.sessions.get_or_create(&peer_pubkey);
+    let my_ephemeral_pubkey = {
+        let mut s = session.write();
+        s.initiate_key_exchange()
+            .map_err(|e| Error::Relay(e))?
+    };
+
+    // 生成随机 nonce
+    let mut nonce_bytes = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce_bytes);
+    let nonce_b64 = base64::engine::general_purpose::STANDARD.encode(&nonce_bytes);
+
+    let timestamp = chrono::Utc::now().timestamp();
+
+    // 签名复合值: ephemeral_pubkey || from || nonce || timestamp
+    let mut signed_data = Vec::new();
+    signed_data.extend_from_slice(&my_ephemeral_pubkey);
+    signed_data.extend_from_slice(from_pubkey.as_bytes());
+    signed_data.extend_from_slice(&nonce_bytes);
+    signed_data.extend_from_slice(&timestamp.to_le_bytes());
+
+    let privkey = identity.decrypt_private_key(&[0u8; 32])?;
+    let signature = crypto::sign_data(&signed_data, &privkey)
+        .map_err(|e| Error::Crypto(e.to_string()))?;
+    let signature_b64 = base64::engine::general_purpose::STANDARD.encode(&signature);
+
+    let ephemeral_pub_b64 = base64::engine::general_purpose::STANDARD.encode(&my_ephemeral_pubkey);
+
+    // 发送 KeyExchange
+    let key_exchange = WsMessage::KeyExchange {
+        from: from_pubkey,
+        to: peer_pubkey,
+        ephemeral_pubkey: ephemeral_pub_b64,
+        signature: signature_b64,
+        nonce: nonce_b64,
+        timestamp,
+    };
+
+    if let Some(tx) = OUTBOUND_TX.read().as_ref() {
+        let _ = tx.try_send(key_exchange);
+    } else {
+        return Err(Error::Relay("No outbound channel".to_string()));
+    }
+
+    info!("KeyExchange sent to peer");
+    Ok(())
+}
+
+/// 获取会话状态
+#[tauri::command]
+pub async fn get_session_status(
+    peer_pubkey: String,
+    state: tauri::State<'_, crate::AppState>,
+) -> Result<String, Error> {
+    match state.sessions.get(&peer_pubkey) {
+        Some(session) => {
+            let s = session.read();
+            Ok(format!("{:?}", s.status))
+        }
+        None => Ok("None".to_string()),
+    }
+}

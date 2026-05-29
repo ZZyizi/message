@@ -161,6 +161,8 @@ pub fn run() {
             relay::send_recall,
             relay::subscribe_messages,
             relay::get_online_users,
+            relay::initiate_key_exchange,
+            relay::get_session_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
