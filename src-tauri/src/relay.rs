@@ -1,7 +1,8 @@
 //! 中继服务器连接模块
 //!
 //! 负责与 Relay 服务器的 WebSocket 连接管理、消息收发。
-//! 支持聊天消息、消息确认（ACK）和消息撤回（Recall）三种消息类型。
+//! 支持聊天消息、消息确认（ACK）、消息撤回（Recall）、
+//! 密钥交换（KeyExchange）和密钥确认（KeyConfirm）五种消息类型。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use parking_lot::RwLock;
@@ -56,6 +57,7 @@ pub enum WsMessage {
         from: String,
         to: String,
         encrypted_confirm: String,
+        timestamp: i64,
     },
     Ping,
     Pong,
