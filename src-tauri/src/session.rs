@@ -84,6 +84,25 @@ impl SessionState {
         }
     }
 
+    /// 发起密钥协商（生成临时密钥对，状态转为 WaitingForPeer）
+    pub fn initiate_key_exchange(&mut self) -> Result<[u8; 32], String> {
+        if self.status == SessionStatus::WaitingForPeer
+            || self.status == SessionStatus::WaitingForConfirm
+        {
+            return Err("Key exchange already in progress".to_string());
+        }
+
+        let (ephemeral_pub, ephemeral_priv) = crypto::generate_x25519_keypair();
+        let mut privkey = [0u8; 32];
+        privkey.copy_from_slice(&ephemeral_priv);
+        self.my_ephemeral_privkey = privkey;
+        self.status = SessionStatus::WaitingForPeer;
+
+        let mut pubkey = [0u8; 32];
+        pubkey.copy_from_slice(&ephemeral_pub);
+        Ok(pubkey)
+    }
+
     /// 获取我方临时公钥
     pub fn my_ephemeral_pubkey(&self) -> [u8; 32] {
         let mut pubkey = [0u8; 32];
@@ -99,6 +118,11 @@ impl SessionState {
         &mut self,
         peer_ephemeral_pubkey: [u8; 32],
     ) -> Result<(), String> {
+        // 守卫：如果临时私钥全为零，说明尚未发起协商
+        if self.my_ephemeral_privkey == [0u8; 32] {
+            return Err("No ephemeral key generated yet".to_string());
+        }
+
         if self.status == SessionStatus::Active {
             // 已建立会话，进入 Rekeying
             info!("Rekeying session with peer: {}", self.peer_static_pubkey);
