@@ -32,6 +32,7 @@ pub enum WsMessage {
         media_id: Option<String>,
         timestamp: i64,
         signature: String,
+        seq_id: i64,
     },
     MessageAck {
         event_id: String,
@@ -42,6 +43,19 @@ pub enum WsMessage {
         ref_event_id: String,
         from: String,
         timestamp: i64,
+    },
+    KeyExchange {
+        from: String,
+        to: String,
+        ephemeral_pubkey: String,
+        signature: String,
+        nonce: String,
+        timestamp: i64,
+    },
+    KeyConfirm {
+        from: String,
+        to: String,
+        encrypted_confirm: String,
     },
     Ping,
     Pong,
@@ -247,7 +261,7 @@ async fn run_websocket_client(
                                 *LAST_PING.write() = Some(chrono::Utc::now().timestamp_millis());
                             }
                             // 处理收到的聊天消息
-                            if let WsMessage::ChatMessage { event_id, from, to, payload, media_id, timestamp, signature } = &ws_msg {
+                            if let WsMessage::ChatMessage { event_id, from, to, payload, media_id, timestamp, signature, seq_id } = &ws_msg {
                                 let app_state = app_handle.state::<crate::AppState>();
                                 let my_pubkey = {
                                     let identity = app_state.identity.read();
@@ -270,7 +284,7 @@ async fn run_websocket_client(
                                     payload: payload.clone(),
                                     media_id: media_id.clone(),
                                     timestamp: *timestamp,
-                                    seq_id: 0,
+                                    seq_id: *seq_id,
                                     signature: signature.clone(),
                                     delivered: true,
                                     recalled: false,
@@ -396,6 +410,7 @@ pub async fn send_chat_message(
         media_id: media_id.clone(),
         timestamp,
         signature: signature_b64.clone(),
+        seq_id,
     };
 
     let json = serde_json::to_string(&ws_msg)
