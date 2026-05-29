@@ -246,11 +246,6 @@ impl SessionState {
         std::mem::take(&mut self.pending_plaintext)
     }
 
-    /// 获取并清空待发明文消息
-    pub fn take_pending_plaintext(&mut self) -> Vec<PendingPlaintext> {
-        std::mem::take(&mut self.pending_plaintext)
-    }
-
     /// 加密消息
     pub fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, String> {
         let key = self.session_key.ok_or("No session key")?;
@@ -346,9 +341,26 @@ git commit -m "feat(e2ee): add session module with state machine and key managem
 **Files:**
 - Modify: `src-tauri/src/relay.rs`
 
-- [ ] **Step 1: 在 WsMessage 枚举中添加新变体**
+- [ ] **Step 1: 在 WsMessage 枚举中添加新变体，并修改 ChatMessage**
 
-在 `relay.rs` 的 `WsMessage` 枚举中添加：
+在 `relay.rs` 的 `WsMessage` 枚举中：
+
+1. 给现有的 `ChatMessage` 添加 `seq_id: i64` 字段：
+
+```rust
+ChatMessage {
+    event_id: String,
+    from: String,
+    to: String,
+    payload: String,
+    media_id: Option<String>,
+    timestamp: i64,
+    signature: String,
+    seq_id: i64,  // 新增：用于接收方验证签名
+},
+```
+
+2. 添加新的变体：
 
 ```rust
 KeyExchange {
@@ -605,21 +617,12 @@ if let WsMessage::KeyExchange { from, to, ephemeral_pubkey, signature, nonce, ti
     // 获取或创建会话
     let session = app_state.sessions.get_or_create(&from);
 
-    // 处理密钥交换
-    {
-        let mut s = session.write();
-        if let Err(e) = s.handle_key_exchange(ephemeral_pub_bytes) {
-            warn!("Failed to handle key exchange: {}", e);
-            continue;
-        }
-    }
-
-    // 检查是否需要回复 KeyExchange（双向协商）
+    // 检查是否需要先回复 KeyExchange（双向协商）
+    // 必须在 handle_key_exchange 之前，因为 handle_key_exchange 会改变状态
     {
         let mut s = session.write();
         if s.status == crate::session::SessionStatus::None {
-            // 我方尚未发送 KeyExchange，需要先发送
-            // 生成新的临时密钥对（因为我们之前没有生成）
+            // 我方尚未发送 KeyExchange，需要先生成密钥并发送
             let (my_ephemeral_pub, my_ephemeral_priv) = crypto::generate_x25519_keypair();
             let my_ephemeral_pub_b64 = base64::engine::general_purpose::STANDARD.encode(&my_ephemeral_pub);
 
@@ -663,6 +666,15 @@ if let WsMessage::KeyExchange { from, to, ephemeral_pubkey, signature, nonce, ti
         }
     }
 
+    // 处理对方的密钥交换（此时我方密钥已就绪）
+    {
+        let mut s = session.write();
+        if let Err(e) = s.handle_key_exchange(ephemeral_pub_bytes) {
+            warn!("Failed to handle key exchange: {}", e);
+            continue;
+        }
+    }
+
     // 发送 KeyConfirm
     {
         let s = session.read();
@@ -687,6 +699,46 @@ if let WsMessage::KeyExchange { from, to, ephemeral_pubkey, signature, nonce, ti
                     let mut s = session.write();
                     s.status = crate::session::SessionStatus::Active;
                     info!("Session activated with peer: {}", from);
+
+                    // 刷新待发明文消息队列
+                    let pending = s.flush_pending_plaintext();
+                    drop(s);
+                    for p in pending {
+                        // 加密并发送每条待发消息
+                        let s = session.read();
+                        if let Ok(enc) = s.encrypt(p.payload.as_bytes()) {
+                            let enc_b64 = base64::engine::general_purpose::STANDARD.encode(&enc);
+                            drop(s);
+
+                            // 签名
+                            let signature_data = format!("{}{}{}{}", p.event_id, my_pubkey, enc_b64, p.seq_id);
+                            let identity = app_state.identity.read();
+                            if let Ok(privkey) = identity.decrypt_private_key(&[0u8; 32]) {
+                                drop(identity);
+                                if let Ok(sig) = crypto::sign_data(signature_data.as_bytes(), &privkey) {
+                                    let sig_b64 = base64::engine::general_purpose::STANDARD.encode(&sig);
+
+                                    // 发送
+                                    let ws_msg = WsMessage::ChatMessage {
+                                        event_id: p.event_id.clone(),
+                                        from: my_pubkey.clone(),
+                                        to: p.to_recipient.clone(),
+                                        payload: enc_b64.clone(),
+                                        media_id: None,
+                                        timestamp: p.created_at,
+                                        signature: sig_b64,
+                                    };
+                                    if let Some(tx) = OUTBOUND_TX.read().as_ref() {
+                                        let _ = tx.try_send(ws_msg);
+                                    }
+
+                                    // 更新数据库：将明文替换为密文
+                                    let db = app_state.db.lock().unwrap();
+                                    let _ = db.update_message_payload(&p.event_id, &enc_b64);
+                                }
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     warn!("Failed to encrypt key confirm: {}", e);
@@ -729,6 +781,40 @@ if let WsMessage::KeyConfirm { from, to, encrypted_confirm } = &ws_msg {
             Ok(plaintext) if plaintext == b"confirm" => {
                 s.status = crate::session::SessionStatus::Active;
                 info!("Session confirmed with peer: {}", from);
+
+                // 刷新待发明文消息队列
+                let pending = s.flush_pending_plaintext();
+                drop(s);
+                for p in pending {
+                    let s = session.read();
+                    if let Ok(enc) = s.encrypt(p.payload.as_bytes()) {
+                        let enc_b64 = base64::engine::general_purpose::STANDARD.encode(&enc);
+                        drop(s);
+
+                        let signature_data = format!("{}{}{}{}", p.event_id, my_pubkey, enc_b64, p.seq_id);
+                        let identity = app_state.identity.read();
+                        if let Ok(privkey) = identity.decrypt_private_key(&[0u8; 32]) {
+                            drop(identity);
+                            if let Ok(sig) = crypto::sign_data(signature_data.as_bytes(), &privkey) {
+                                let sig_b64 = base64::engine::general_purpose::STANDARD.encode(&sig);
+                                let ws_msg = WsMessage::ChatMessage {
+                                    event_id: p.event_id.clone(),
+                                    from: my_pubkey.clone(),
+                                    to: p.to_recipient.clone(),
+                                    payload: enc_b64.clone(),
+                                    media_id: None,
+                                    timestamp: p.created_at,
+                                    signature: sig_b64,
+                                };
+                                if let Some(tx) = OUTBOUND_TX.read().as_ref() {
+                                    let _ = tx.try_send(ws_msg);
+                                }
+                                let db = app_state.db.lock().unwrap();
+                                let _ = db.update_message_payload(&p.event_id, &enc_b64);
+                            }
+                        }
+                    }
+                }
             }
             Ok(_) => {
                 warn!("KeyConfirm content mismatch from {}", from);
@@ -814,6 +900,58 @@ Expected: 编译通过
 ```bash
 git add src-tauri/src/relay.rs
 git commit -m "feat(e2ee): add session timeout mechanism for key exchange"
+```
+
+---
+
+### Task 5.6: 添加数据库更新方法和修改 send_chat_message
+
+**Files:**
+- Modify: `src-tauri/src/db.rs`
+- Modify: `src-tauri/src/relay.rs`
+
+- [ ] **Step 1: 在 db.rs 中添加 update_message_payload 方法**
+
+在 `Database` 实现中添加：
+
+```rust
+/// 更新消息的 payload（用于将明文替换为密文）
+pub fn update_message_payload(&self, event_id: &str, new_payload: &str) -> Result<(), Error> {
+    self.conn.execute(
+        "UPDATE messages SET payload = ?1 WHERE event_id = ?2",
+        rusqlite::params![new_payload, event_id],
+    )?;
+    Ok(())
+}
+```
+
+- [ ] **Step 2: 修改 send_chat_message 中的 WsMessage 构造**
+
+在 `relay.rs` 的 `send_chat_message` 中，给 `WsMessage::ChatMessage` 添加 `seq_id` 字段：
+
+```rust
+let ws_msg = WsMessage::ChatMessage {
+    event_id: event_id.clone(),
+    from: from_pubkey.to_string(),
+    to: to.clone(),
+    payload: encrypted_payload.clone(),
+    media_id: media_id.clone(),
+    timestamp,
+    signature: signature_b64.clone(),
+    seq_id,  // 新增
+};
+```
+
+- [ ] **Step 3: 编译验证**
+
+Run: `cd src-tauri && cargo check`
+Expected: 编译通过
+
+- [ ] **Step 4: 提交**
+
+```bash
+git add src-tauri/src/db.rs src-tauri/src/relay.rs
+git commit -m "feat(e2ee): add update_message_payload and include seq_id in ChatMessage"
 ```
 
 ---
@@ -931,7 +1069,7 @@ git commit -m "feat(e2ee): encrypt outgoing messages when session is active"
 在 `run_websocket_client` 中处理 `ChatMessage` 时，接收后尝试解密：
 
 ```rust
-if let WsMessage::ChatMessage { event_id, from, to, payload, media_id, timestamp, signature } = &ws_msg {
+if let WsMessage::ChatMessage { event_id, from, to, payload, media_id, timestamp, signature, seq_id } = &ws_msg {
     let app_state = app_handle.state::<crate::AppState>();
     let my_pubkey = {
         let identity = app_state.identity.read();
@@ -943,11 +1081,7 @@ if let WsMessage::ChatMessage { event_id, from, to, payload, media_id, timestamp
         continue;
     }
 
-    // 验证签名
-    let seq_id = {
-        let db = app_state.db.lock().unwrap();
-        db.get_next_seq_id(to).unwrap_or(0)
-    };
+    // 验证签名（使用消息中携带的 seq_id）
     let signature_data = format!("{}{}{}{}", event_id, from, payload, seq_id);
     if let Ok(from_pubkey_bytes) = base64::engine::general_purpose::STANDARD.decode(from) {
         if let Ok(sig_bytes) = base64::engine::general_purpose::STANDARD.decode(signature) {
