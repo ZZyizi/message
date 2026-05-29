@@ -40,14 +40,14 @@ pub fn generate_identity_keypair() -> (Vec<u8>, Vec<u8>) {
     (verifying_key.as_bytes().to_vec(), signing_key.to_bytes().to_vec())
 }
 
-/// 生成设备密钥对（X25519）
+/// 生成 X25519 密钥对
 ///
-/// 用于设备间密钥交换（ECDH）。
+/// 用于设备间密钥交换（ECDH）和临时会话密钥。
 /// - 公钥：可用于与其他设备建立加密通道
 /// - 私钥：用于密钥协商，需安全存储
 ///
 /// 返回 (公钥, 私钥)，均为 32 字节。
-pub fn generate_device_keypair() -> (Vec<u8>, Vec<u8>) {
+pub fn generate_x25519_keypair() -> (Vec<u8>, Vec<u8>) {
     let secret = StaticSecret::random_from_rng(OsRng);
     let public = PublicKey::from(&secret);
     (public.as_bytes().to_vec(), secret.as_bytes().to_vec())
@@ -257,12 +257,12 @@ pub fn cmd_generate_identity_keypair() -> Result<(String, String), Error> {
     ))
 }
 
-/// Tauri 命令：生成设备密钥对
+/// Tauri 命令：生成 X25519 密钥对
 ///
 /// 返回 (公钥, 私钥)，均为 Base64 编码。
 #[tauri::command]
-pub fn cmd_generate_device_keypair() -> Result<(String, String), Error> {
-    let (pubkey, privkey) = generate_device_keypair();
+pub fn cmd_generate_x25519_keypair() -> Result<(String, String), Error> {
+    let (pubkey, privkey) = generate_x25519_keypair();
     Ok((
         base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &pubkey),
         base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &privkey),

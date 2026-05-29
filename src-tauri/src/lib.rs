@@ -130,7 +130,7 @@ pub fn run() {
             crypto::encrypt_message_cmd,
             crypto::decrypt_message_cmd,
             crypto::cmd_generate_identity_keypair,
-            crypto::cmd_generate_device_keypair,
+            crypto::cmd_generate_x25519_keypair,
             // 身份管理命令
             identity::get_public_key,
             identity::export_identity_mnemonic,
