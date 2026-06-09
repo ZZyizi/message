@@ -87,6 +87,12 @@ pub async fn sync_online_contacts(
 ) -> Result<Vec<ContactInfo>, Error> {
     let now = chrono::Utc::now().timestamp_millis();
 
+    // 获取自己的公钥，用于过滤掉自己
+    let my_pubkey = {
+        let identity = state.identity.read();
+        identity.get_public_key().unwrap_or("").to_string()
+    };
+
     // 获取在线用户列表
     let online_pubkeys = match crate::relay::fetch_online_users().await {
         Ok(users) => users,
@@ -113,6 +119,10 @@ pub async fn sync_online_contacts(
     let mut result = Vec::new();
 
     for contact in contacts {
+        // 跳过自己（自己不需要跟自己建立 E2EE 会话、也不能发消息给自己）
+        if contact.pubkey == my_pubkey {
+            continue;
+        }
         let nickname = decrypt_nickname(contact.encrypted_nickname.as_deref(), &state);
         let is_online = online_set.contains(&contact.pubkey);
 
@@ -124,8 +134,11 @@ pub async fn sync_online_contacts(
         });
     }
 
-    // 把在线但不在联系人表中的用户也加入结果
+    // 把在线但不在联系人表中的用户也加入结果（同样排除自己）
     for pubkey in &online_pubkeys {
+        if pubkey == &my_pubkey {
+            continue;
+        }
         if !result.iter().any(|c| &c.pubkey == pubkey) {
             result.push(ContactInfo {
                 pubkey: pubkey.clone(),
