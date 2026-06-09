@@ -54,7 +54,8 @@ pub async fn send_message(
 
     // 签名数据：event_id + from_pubkey + payload + seq_id
     let signature_data = format!("{}{}{}{}", event_id, from_pubkey, request.payload, seq_id);
-    let privkey = identity.decrypt_private_key(&[0u8; 32])?;
+    let key = state.current_encryption_key()?;
+    let privkey = identity.decrypt_private_key(&key)?;
     let signature = crypto::sign_data(signature_data.as_bytes(), &privkey)
         .map_err(|e| Error::Crypto(e.to_string()))?;
     let signature_b64 = base64::engine::general_purpose::STANDARD.encode(&signature);

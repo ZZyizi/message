@@ -36,7 +36,7 @@ pub enum WsMessage {
         seq_id: i64,
     },
     MessageAck {
-        event_id: String,
+        ref_event_id: String,
         from: String,
         timestamp: i64,
     },
@@ -337,6 +337,18 @@ async fn run_websocket_client(
                                 let mut display_msg = msg.clone();
                                 display_msg.payload = decrypted_for_display;
                                 let _ = app_handle.emit("new_message", &display_msg);
+
+                                // 自动回 ACK：告知发送方已成功接收并入库
+                                let ack = WsMessage::MessageAck {
+                                    ref_event_id: event_id.clone(),
+                                    from: my_pubkey.clone(),
+                                    timestamp: chrono::Utc::now().timestamp_millis(),
+                                };
+                                if let Some(tx) = OUTBOUND_TX.read().as_ref() {
+                                    if let Err(e) = tx.try_send(ack) {
+                                        warn!("Failed to auto-send ACK: {}", e);
+                                    }
+                                }
                             }
                             // 收到消息撤回
                             if let WsMessage::MessageRecall { ref_event_id, .. } = &ws_msg {
@@ -346,6 +358,21 @@ async fn run_websocket_client(
                                     error!("Failed to recall message: {}", e);
                                 }
                                 let _ = app_handle.emit("message_recalled", ref_event_id);
+                            }
+
+                            // 收到消息 ACK：从 pending 队列删除并标记已送达
+                            if let WsMessage::MessageAck { ref_event_id, .. } = &ws_msg {
+                                let app_state = app_handle.state::<crate::AppState>();
+                                {
+                                    let db = app_state.db.lock().unwrap();
+                                    if let Err(e) = db.delete_pending(ref_event_id) {
+                                        error!("Failed to remove pending on ACK: {}", e);
+                                    }
+                                    if let Err(e) = db.mark_message_delivered(ref_event_id) {
+                                        error!("Failed to mark delivered on ACK: {}", e);
+                                    }
+                                }
+                                let _ = app_handle.emit("message_delivered", ref_event_id);
                             }
 
                             // 处理密钥交换消息
@@ -450,7 +477,9 @@ async fn run_websocket_client(
 
                                         let my_privkey = {
                                             let identity = app_state.identity.read();
-                                            match identity.decrypt_private_key(&[0u8; 32]) {
+                                            match app_state.current_encryption_key()
+                                                .and_then(|key| identity.decrypt_private_key(&key).map_err(|e| e))
+                                            {
                                                 Ok(key) => key,
                                                 Err(e) => {
                                                     warn!("Failed to decrypt private key: {}", e);
@@ -530,27 +559,29 @@ async fn run_websocket_client(
 
                                                         let signature_data = format!("{}{}{}{}", p.event_id, my_pubkey, enc_b64, p.seq_id);
                                                         let identity = app_state.identity.read();
-                                                        if let Ok(privkey) = identity.decrypt_private_key(&[0u8; 32]) {
-                                                            drop(identity);
-                                                            if let Ok(sig) = crypto::sign_data(signature_data.as_bytes(), &privkey) {
-                                                                let sig_b64 = base64::engine::general_purpose::STANDARD.encode(&sig);
+                                                        if let Ok(key) = app_state.current_encryption_key() {
+                                                            if let Ok(privkey) = identity.decrypt_private_key(&key) {
+                                                                drop(identity);
+                                                                if let Ok(sig) = crypto::sign_data(signature_data.as_bytes(), &privkey) {
+                                                                    let sig_b64 = base64::engine::general_purpose::STANDARD.encode(&sig);
 
-                                                                let ws_msg = WsMessage::ChatMessage {
-                                                                    event_id: p.event_id.clone(),
-                                                                    from: my_pubkey.clone(),
-                                                                    to: p.to_recipient.clone(),
-                                                                    payload: enc_b64.clone(),
-                                                                    media_id: None,
-                                                                    timestamp: p.created_at,
-                                                                    signature: sig_b64.clone(),
-                                                                    seq_id: p.seq_id,
-                                                                };
-                                                                if let Some(tx) = OUTBOUND_TX.read().as_ref() {
-                                                                    let _ = tx.try_send(ws_msg);
+                                                                    let ws_msg = WsMessage::ChatMessage {
+                                                                        event_id: p.event_id.clone(),
+                                                                        from: my_pubkey.clone(),
+                                                                        to: p.to_recipient.clone(),
+                                                                        payload: enc_b64.clone(),
+                                                                        media_id: None,
+                                                                        timestamp: p.created_at,
+                                                                        signature: sig_b64.clone(),
+                                                                        seq_id: p.seq_id,
+                                                                    };
+                                                                    if let Some(tx) = OUTBOUND_TX.read().as_ref() {
+                                                                        let _ = tx.try_send(ws_msg);
+                                                                    }
+
+                                                                    let db = app_state.db.lock().unwrap();
+                                                                    let _ = db.update_message_payload_and_signature(&p.event_id, &enc_b64, &sig_b64);
                                                                 }
-
-                                                                let db = app_state.db.lock().unwrap();
-                                                                let _ = db.update_message_payload_and_signature(&p.event_id, &enc_b64, &sig_b64);
                                                             }
                                                         }
                                                     }
@@ -603,25 +634,27 @@ async fn run_websocket_client(
 
                                                     let signature_data = format!("{}{}{}{}", p.event_id, my_pubkey, enc_b64, p.seq_id);
                                                     let identity = app_state.identity.read();
-                                                    if let Ok(privkey) = identity.decrypt_private_key(&[0u8; 32]) {
-                                                        drop(identity);
-                                                        if let Ok(sig) = crypto::sign_data(signature_data.as_bytes(), &privkey) {
-                                                            let sig_b64 = base64::engine::general_purpose::STANDARD.encode(&sig);
-                                                            let ws_msg = WsMessage::ChatMessage {
-                                                                event_id: p.event_id.clone(),
-                                                                from: my_pubkey.clone(),
-                                                                to: p.to_recipient.clone(),
-                                                                payload: enc_b64.clone(),
-                                                                media_id: None,
-                                                                timestamp: p.created_at,
-                                                                signature: sig_b64.clone(),
-                                                                seq_id: p.seq_id,
-                                                            };
-                                                            if let Some(tx) = OUTBOUND_TX.read().as_ref() {
-                                                                let _ = tx.try_send(ws_msg);
+                                                    if let Ok(key) = app_state.current_encryption_key() {
+                                                        if let Ok(privkey) = identity.decrypt_private_key(&key) {
+                                                            drop(identity);
+                                                            if let Ok(sig) = crypto::sign_data(signature_data.as_bytes(), &privkey) {
+                                                                let sig_b64 = base64::engine::general_purpose::STANDARD.encode(&sig);
+                                                                let ws_msg = WsMessage::ChatMessage {
+                                                                    event_id: p.event_id.clone(),
+                                                                    from: my_pubkey.clone(),
+                                                                    to: p.to_recipient.clone(),
+                                                                    payload: enc_b64.clone(),
+                                                                    media_id: None,
+                                                                    timestamp: p.created_at,
+                                                                    signature: sig_b64.clone(),
+                                                                    seq_id: p.seq_id,
+                                                                };
+                                                                if let Some(tx) = OUTBOUND_TX.read().as_ref() {
+                                                                    let _ = tx.try_send(ws_msg);
+                                                                }
+                                                                let db = app_state.db.lock().unwrap();
+                                                                let _ = db.update_message_payload_and_signature(&p.event_id, &enc_b64, &sig_b64);
                                                             }
-                                                            let db = app_state.db.lock().unwrap();
-                                                            let _ = db.update_message_payload_and_signature(&p.event_id, &enc_b64, &sig_b64);
                                                         }
                                                     }
                                                 }
@@ -753,7 +786,8 @@ pub async fn send_chat_message(
 
     // 签名数据：event_id + from + 加密后的payload + seq_id
     let signature_data = format!("{}{}{}{}", event_id, from_pubkey, encrypted_payload, seq_id);
-    let privkey = identity.decrypt_private_key(&[0u8; 32])?;
+    let key = state.current_encryption_key()?;
+    let privkey = identity.decrypt_private_key(&key)?;
     let signature = crypto::sign_data(signature_data.as_bytes(), &privkey)
         .map_err(|e| Error::Crypto(e.to_string()))?;
     let signature_b64 = base64::engine::general_purpose::STANDARD.encode(&signature);
@@ -773,9 +807,27 @@ pub async fn send_chat_message(
         delivered: false,
         recalled: false,
     };
+    let pending_payload = serde_json::json!({
+        "event_id": event_id,
+        "to": to,
+        "payload": encrypted_payload,
+        "media_id": media_id,
+        "timestamp": timestamp,
+        "signature": signature_b64,
+        "seq_id": seq_id,
+    }).to_string();
+    let pending = crate::db::PendingMessage {
+        id: uuid::Uuid::new_v4().to_string(),
+        event_id: db_msg.event_id.clone(),
+        to_recipient: db_msg.to_recipient.clone(),
+        payload: pending_payload,
+        created_at: timestamp,
+        retry_count: 0,
+    };
     {
         let db = state.db.lock().unwrap();
         db.insert_message(&db_msg)?;
+        db.insert_pending(&pending)?;
     }
 
     if should_send_now {
@@ -835,13 +887,13 @@ pub async fn send_ack(
         .ok_or_else(|| Error::Identity("No identity found".to_string()))?;
 
     let ack = WsMessage::MessageAck {
-        event_id,
+        ref_event_id: event_id,
         from: from_pubkey.to_string(),
         timestamp: chrono::Utc::now().timestamp_millis(),
     };
 
-    let event_id_clone = if let WsMessage::MessageAck { event_id, .. } = &ack {
-        event_id.clone()
+    let ref_event_id_clone = if let WsMessage::MessageAck { ref_event_id, .. } = &ack {
+        ref_event_id.clone()
     } else {
         return Err(Error::Relay("Invalid message type".to_string()));
     };
@@ -854,7 +906,7 @@ pub async fn send_ack(
     // 确认成功后从 pending 表删除（消息已确认，无需重试）
     {
         let db = state.db.lock().unwrap();
-        db.delete_pending(&event_id_clone)?;
+        db.delete_pending(&ref_event_id_clone)?;
     }
 
     Ok(())
@@ -1016,7 +1068,10 @@ pub async fn initiate_key_exchange(
     signed_data.extend_from_slice(&nonce_bytes);
     signed_data.extend_from_slice(&timestamp.to_le_bytes());
 
-    let privkey = identity.decrypt_private_key(&[0u8; 32])?;
+    let privkey = {
+        let key = state.current_encryption_key()?;
+        identity.decrypt_private_key(&key)?
+    };
     let signature = crypto::sign_data(&signed_data, &privkey)
         .map_err(|e| Error::Crypto(e.to_string()))?;
     let signature_b64 = base64::engine::general_purpose::STANDARD.encode(&signature);
@@ -1075,5 +1130,132 @@ pub async fn get_session_status(
             Ok(format!("{:?}", s.status))
         }
         None => Ok("None".to_string()),
+    }
+}
+
+/// Pending 消息重试循环
+///
+/// 每 5 秒扫描一次 `pending_messages` 表：
+/// - 已连接 Relay 且会话已建立：重新发送
+/// - 重试次数达到上限（默认 5 次）：放弃，标记消息为不可达
+/// - 未连接 Relay：跳过本轮
+///
+/// 使用指数退避策略：每次重试前等待 2^retry_count 秒（最多 60 秒）
+pub async fn start_pending_retry_loop(app_handle: tauri::AppHandle) {
+    use crate::db::PendingMessage;
+
+    info!("Starting pending message retry loop");
+
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+        let state = app_handle.state::<crate::AppState>();
+
+        // 仅在已连接时重试
+        if *CLIENT_STATE.read() != ConnectionState::Connected {
+            continue;
+        }
+
+        // 读取待重发消息（最多 50 条，避免单轮过载）
+        let pending_list: Vec<PendingMessage> = {
+            let db = match state.db.lock() {
+                Ok(g) => g,
+                Err(_) => continue,
+            };
+            match db.get_pending_messages(50) {
+                Ok(v) => v,
+                Err(e) => {
+                    error!("Failed to read pending messages: {}", e);
+                    continue;
+                }
+            }
+        };
+
+        if pending_list.is_empty() {
+            continue;
+        }
+
+        let identity = state.identity.read();
+        let from_pubkey = match identity.get_public_key() {
+            Some(p) => p.to_string(),
+            None => continue,
+        };
+
+        for pending in pending_list {
+            // 退避：已重试 N 次则等待 2^N 秒（最多 60 秒）
+            let backoff_secs = std::cmp::min(2_i64.saturating_pow(pending.retry_count as u32), 60);
+            let elapsed_secs = (chrono::Utc::now().timestamp_millis() - pending.created_at) / 1000;
+            if pending.retry_count > 0 && elapsed_secs < backoff_secs {
+                continue;
+            }
+
+            // 检查目标会话是否已激活
+            let session = match state.sessions.get(&pending.to_recipient) {
+                Some(s) => s,
+                None => {
+                    // 等待中：稍后再试，不增加 retry_count
+                    continue;
+                }
+            };
+            {
+                let s = session.read();
+                if s.status != crate::session::SessionStatus::Active {
+                    continue;
+                }
+            }
+
+            // 解析 payload 并重新发送
+            let parsed: serde_json::Value = match serde_json::from_str(&pending.payload) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("Invalid pending payload for {}: {}", pending.event_id, e);
+                    continue;
+                }
+            };
+
+            let to = parsed.get("to").and_then(|v| v.as_str()).unwrap_or(&pending.to_recipient).to_string();
+            let payload = parsed.get("payload").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let media_id = parsed.get("media_id").and_then(|v| v.as_str()).map(String::from);
+            let timestamp = parsed.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(pending.created_at);
+            let signature = parsed.get("signature").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let seq_id = parsed.get("seq_id").and_then(|v| v.as_i64()).unwrap_or(0);
+
+            let ws_msg = WsMessage::ChatMessage {
+                event_id: pending.event_id.clone(),
+                from: from_pubkey.clone(),
+                to: to.clone(),
+                payload,
+                media_id,
+                timestamp,
+                signature,
+                seq_id,
+            };
+
+            let sent = if let Some(tx) = OUTBOUND_TX.read().as_ref() {
+                tx.try_send(ws_msg).is_ok()
+            } else {
+                false
+            };
+
+            if sent {
+                // 发送成功：递增 retry_count
+                if let Ok(db) = state.db.lock() {
+                    if let Err(e) = db.increment_pending_retry(&pending.event_id) {
+                        error!("Failed to bump retry_count: {}", e);
+                    }
+                }
+                debug!("Retried pending message {} (attempt {})", pending.event_id, pending.retry_count + 1);
+            }
+        }
+
+        // 清理超过 7 天的过期 pending 消息
+        match state.db.lock() {
+            Ok(db) => {
+                if let Err(e) = db.cleanup_expired_pending(7 * 24 * 60 * 60) {
+                    error!("Failed to cleanup expired pending: {}", e);
+                }
+            }
+            Err(_) => {}
+        };
     }
 }

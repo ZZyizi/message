@@ -48,7 +48,19 @@
       "mcp__codegraph__codegraph_files",
       "mcp__codegraph__codegraph_explore",
       "Bash(bash test-e2ee.sh)",
-      "Bash(cargo test *)"
+      "Bash(cargo test *)",
+      "Bash(awk '/MNEMONIC_WORDS/,/\\\\];/' d:/project/message/src-tauri/src/identity.rs)",
+      "Bash(python -c \"print\\(',\\\\n    '.join\\(repr\\(f'\\\\\"{i:04x}\\\\\"'\\) for i in range\\(256\\)\\)\\)\")",
+      "Read(//tmp/**)",
+      "Bash(cat /tmp/wordlist_formatted.txt > d:/project/message/src-tauri/src/identity_mnemonic_words.txt 2>/dev/null; cat /tmp/wordlist_formatted.txt | tr -d '\\\\r' > /tmp/wl.txt && wc -l /tmp/wl.txt)",
+      "Bash(awk 'BEGIN{print \"    \\\\\\\\\"0000\\\\\\\\\", \\\\\\\\\"0001\\\\\\\\\", ... \\(truncated, 256 entries\\)\"}')",
+      "Bash(python3)",
+      "Bash(python -c ' *)",
+      "Bash(python)",
+      "mcp__codegraph__codegraph_node"
+    ],
+    "additionalDirectories": [
+      "\\tmp"
     ]
   }
 }

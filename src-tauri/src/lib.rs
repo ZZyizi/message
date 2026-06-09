@@ -22,6 +22,7 @@ use parking_lot::RwLock;
 use tauri::Manager;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
+use zeroize::Zeroize;
 
 pub use error::Error;
 
@@ -30,6 +31,7 @@ pub use error::Error;
 /// - `db`: SQLite 数据库连接（线程安全）
 /// - `identity`: 身份管理器（存储用户的公私钥对）
 /// - `app_handle`: Tauri 应用句柄，用于发送事件到前端
+/// - `encryption_key`: 解锁后的派生密钥（None 表示身份已锁定）
 pub struct AppState {
     /// 数据库连接，使用 Mutex 保证线程安全
     pub db: Arc<Mutex<db::Database>>,
@@ -41,6 +43,26 @@ pub struct AppState {
     pub app_handle: tauri::AppHandle,
     /// E2EE 会话管理器
     pub sessions: session::SessionManager,
+    /// 已解锁的身份加密密钥（Argon2 派生），未解锁时为 None
+    pub encryption_key: Arc<RwLock<Option<[u8; 32]>>>,
+}
+
+impl AppState {
+    /// 获取当前解锁的加密密钥
+    ///
+    /// 若身份未解锁则返回 `Error::Identity` —— 调用方应先调用 `unlock_identity`。
+    pub fn current_encryption_key(&self) -> Result<[u8; 32], Error> {
+        self.encryption_key.read().ok_or_else(|| {
+            Error::Identity("Identity is locked. Call unlock_identity() first.".to_string())
+        })
+    }
+
+    /// 锁定身份（清除内存中的加密密钥）
+    pub fn lock(&self) {
+        if let Some(mut key) = self.encryption_key.write().take() {
+            key.zeroize();
+        }
+    }
 }
 
 /// 初始化日志系统
@@ -122,7 +144,14 @@ pub fn run() {
                 identity: Arc::new(RwLock::new(identity)),
                 app_handle: app.handle().clone(),
                 sessions: session::SessionManager::new(),
+                encryption_key: Arc::new(RwLock::new(None)),
             };
+
+            // 启动 pending 消息重试后台任务（只需要 app_handle 引用）
+            let app_handle_for_retry = state.app_handle.clone();
+            tauri::async_runtime::spawn(async move {
+                relay::start_pending_retry_loop(app_handle_for_retry).await;
+            });
 
             app.manage(state);
 
@@ -140,6 +169,10 @@ pub fn run() {
             identity::export_identity_mnemonic,
             identity::import_identity_mnemonic,
             identity::auto_create_identity,
+            identity::setup_identity,
+            identity::unlock_identity,
+            identity::lock_identity,
+            identity::is_unlocked,
             identity::get_nickname,
             identity::set_nickname,
             // 联系人命令

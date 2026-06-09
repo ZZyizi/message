@@ -7,6 +7,7 @@
 //! - 消息加密解密（AES-256-GCM）
 //! - 数据签名与验证（Ed25519）
 //! - 哈希运算（SHA256, BLAKE3）
+//! - 口令派生（Argon2id）
 //!
 //! 所有密钥和签名均使用 Base64 编码进行传输。
 
@@ -14,7 +15,9 @@ use aes_gcm::{
     aead::{Aead, KeyInit, OsRng},
     Aes256Gcm, Nonce,
 };
+use argon2::{Argon2, Algorithm, Version, Params};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use password_hash::{PasswordHasher, SaltString};
 use rand::RngCore;
 use sha2::{Sha256, Digest};
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -210,6 +213,49 @@ pub fn blake3_keyed_hash(data: &[u8], key: &[u8]) -> Vec<u8> {
     let mut hasher = blake3::Hasher::new_keyed(&key_arr);
     hasher.update(data);
     hasher.finalize().as_bytes().to_vec()
+}
+
+/// 从用户口令派生 32 字节加密密钥（Argon2id）
+///
+/// 使用 Argon2id（m=19MiB, t=2, p=1）—— OWASP 推荐参数。
+/// 盐使用 PHC 字符串（`SaltString::encode_b64` 格式），由调用方生成并持久化。
+///
+/// 派生出的 32 字节密钥可用于 AES-256-GCM 加解密身份私钥。
+pub fn derive_key_from_passphrase(passphrase: &str, salt_b64: &str) -> Result<[u8; 32], Error> {
+    let salt = SaltString::from_b64(salt_b64)
+        .map_err(|e| Error::Crypto(format!("Invalid salt: {}", e)))?;
+
+    // OWASP 推荐的 Argon2id 参数：m=19456 KiB, t=2, p=1
+    let params = Params::new(19456, 2, 1, Some(32))
+        .map_err(|e| Error::Crypto(format!("Invalid Argon2 params: {}", e)))?;
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+
+    let hash = argon2
+        .hash_password(passphrase.as_bytes(), &salt)
+        .map_err(|e| Error::Crypto(format!("Argon2 hash failed: {}", e)))?;
+
+    let output = hash
+        .hash
+        .ok_or_else(|| Error::Crypto("Argon2 produced no hash".to_string()))?;
+
+    let mut key = [0u8; 32];
+    let bytes = output.as_bytes();
+    if bytes.len() < 32 {
+        return Err(Error::Crypto("Argon2 output too short".to_string()));
+    }
+    key.copy_from_slice(&bytes[..32]);
+    Ok(key)
+}
+
+/// 生成 16 字节随机盐并以 PHC b64 编码返回
+///
+/// 盐应当与加密后的私钥一起持久化，再次派生时使用同一盐。
+pub fn generate_salt() -> Result<String, Error> {
+    let mut bytes = [0u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    Ok(SaltString::encode_b64(&bytes)
+        .map_err(|e| Error::Crypto(format!("Failed to encode salt: {}", e)))?
+        .to_string())
 }
 
 /// Tauri 命令：加密消息（Base64 输入/输出）
@@ -454,6 +500,55 @@ mod tests {
         let h1 = blake3_keyed_hash(b"hello", &key1);
         let h2 = blake3_keyed_hash(b"hello", &key2);
         assert_ne!(h1, h2);
+    }
+
+    // ========== 口令派生（Argon2id） ==========
+
+    #[test]
+    fn test_derive_key_deterministic() {
+        let salt = generate_salt().unwrap();
+        let key1 = derive_key_from_passphrase("correct horse battery staple", &salt).unwrap();
+        let key2 = derive_key_from_passphrase("correct horse battery staple", &salt).unwrap();
+        assert_eq!(key1, key2, "相同口令+盐应派生相同密钥");
+        assert_eq!(key1.len(), 32);
+    }
+
+    #[test]
+    fn test_derive_key_different_passphrase() {
+        let salt = generate_salt().unwrap();
+        let k1 = derive_key_from_passphrase("passphrase-a", &salt).unwrap();
+        let k2 = derive_key_from_passphrase("passphrase-b", &salt).unwrap();
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn test_derive_key_different_salt() {
+        let s1 = generate_salt().unwrap();
+        let s2 = generate_salt().unwrap();
+        let k1 = derive_key_from_passphrase("same", &s1).unwrap();
+        let k2 = derive_key_from_passphrase("same", &s2).unwrap();
+        assert_ne!(k1, k2, "不同盐应派生不同密钥");
+    }
+
+    #[test]
+    fn test_derive_key_can_encrypt_decrypt_identity() {
+        let salt = generate_salt().unwrap();
+        let key = derive_key_from_passphrase("user-passphrase", &salt).unwrap();
+        let identity_privkey = [42u8; 32];
+
+        // 用派生 key 加密身份私钥
+        let encrypted = encrypt_message(&identity_privkey, &key, None).unwrap();
+        // 重新派生并解密应得到原值
+        let key2 = derive_key_from_passphrase("user-passphrase", &salt).unwrap();
+        let decrypted = decrypt_message(&encrypted, &key2, None).unwrap();
+        assert_eq!(decrypted, identity_privkey.to_vec());
+    }
+
+    #[test]
+    fn test_generate_salt_unique() {
+        let s1 = generate_salt().unwrap();
+        let s2 = generate_salt().unwrap();
+        assert_ne!(s1, s2);
     }
 
     // ========== E2EE 完整流程 ==========

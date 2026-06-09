@@ -28,7 +28,8 @@ pub fn save_contact(
     let encrypted = if nickname.is_empty() {
         None
     } else {
-        let encrypted_bytes = crypto::encrypt_message(nickname.as_bytes(), &[0u8; 32], None)?;
+        let key = state.current_encryption_key()?;
+        let encrypted_bytes = crypto::encrypt_message(nickname.as_bytes(), &key, None)?;
         Some(base64::engine::general_purpose::STANDARD.encode(&encrypted_bytes))
     };
 
@@ -54,7 +55,7 @@ pub fn get_contacts(
         if c.pubkey == my_pubkey {
             continue; // 跳过自己
         }
-        let nickname = decrypt_nickname(c.encrypted_nickname.as_deref());
+        let nickname = decrypt_nickname(c.encrypted_nickname.as_deref(), &state);
         result.push(ContactInfo {
             pubkey: c.pubkey,
             nickname,
@@ -112,7 +113,7 @@ pub async fn sync_online_contacts(
     let mut result = Vec::new();
 
     for contact in contacts {
-        let nickname = decrypt_nickname(contact.encrypted_nickname.as_deref());
+        let nickname = decrypt_nickname(contact.encrypted_nickname.as_deref(), &state);
         let is_online = online_set.contains(&contact.pubkey);
 
         result.push(ContactInfo {
@@ -145,14 +146,21 @@ pub async fn sync_online_contacts(
 }
 
 /// 解密昵称（Base64 → AES-256-GCM 解密 → UTF-8）
-fn decrypt_nickname(encrypted: Option<&str>) -> String {
+///
+/// 需要 AppState 引用以获取当前解锁的 encryption key。
+/// 若身份未解锁或解密失败，返回空字符串。
+fn decrypt_nickname(encrypted: Option<&str>, state: &crate::AppState) -> String {
     let Some(data) = encrypted else {
         return String::new();
+    };
+    let key = match state.current_encryption_key() {
+        Ok(k) => k,
+        Err(_) => return String::new(),
     };
     let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) else {
         return String::new();
     };
-    let Ok(decrypted) = crypto::decrypt_message(&bytes, &[0u8; 32], None) else {
+    let Ok(decrypted) = crypto::decrypt_message(&bytes, &key, None) else {
         return String::new();
     };
     String::from_utf8(decrypted).unwrap_or_default()

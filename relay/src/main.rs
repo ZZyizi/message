@@ -42,6 +42,7 @@ pub enum WsMessage {
         media_id: Option<String>,
         timestamp: i64,
         signature: String,
+        seq_id: i64,
     },
     /// 消息已收到确认
     MessageAck {
@@ -53,6 +54,22 @@ pub enum WsMessage {
     MessageRecall {
         ref_event_id: String,
         from: String,
+        timestamp: i64,
+    },
+    /// E2EE 密钥交换（服务器只做转发，不解析）
+    KeyExchange {
+        from: String,
+        to: String,
+        ephemeral_pubkey: String,
+        signature: String,
+        nonce: String,
+        timestamp: i64,
+    },
+    /// E2EE 密钥确认（服务器只做转发，不解析）
+    KeyConfirm {
+        from: String,
+        to: String,
+        encrypted_confirm: String,
         timestamp: i64,
     },
     /// 心跳
@@ -76,6 +93,10 @@ struct AppState {
 
     // 消息缓存：event_id -> (msg, expire_at_ms)，TTL 7 天，过期自动清理
     cache: RwLock<HashMap<String, (WsMessage, i64)>>,
+
+    // E2EE 协商消息暂存：recipient_pubkey -> Vec<(msg, expire_at_ms)>
+    // 目标 pubkey 上线时投递（短 TTL 5 分钟，避免堆积陈旧协商）
+    pending_e2ee: RwLock<HashMap<String, Vec<(WsMessage, i64)>>>,
 }
 
 impl AppState {
@@ -83,6 +104,7 @@ impl AppState {
         Self {
             clients: RwLock::new(HashMap::new()),
             cache: RwLock::new(HashMap::new()),
+            pending_e2ee: RwLock::new(HashMap::new()),
         }
     }
 }
@@ -135,7 +157,22 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, pubkey: String) 
     // 注册客户端（如果已有连接则替换）
     {
         let mut clients = state.clients.write();
-        clients.insert(pubkey.clone(), Arc::new(ClientSession { tx }));
+        clients.insert(pubkey.clone(), Arc::new(ClientSession { tx: tx.clone() }));
+    }
+
+    // 投递暂存的 E2EE 协商消息（KeyExchange/KeyConfirm），仅一次
+    {
+        let mut pending = state.pending_e2ee.write();
+        if let Some(queue) = pending.remove(&pubkey) {
+            let now = Utc::now().timestamp_millis();
+            for (msg, expire_at) in queue {
+                if expire_at > now {
+                    if tx.send(msg).is_err() {
+                        warn!("Failed to deliver queued E2EE message to {}", pubkey);
+                    }
+                }
+            }
+        }
     }
 
     let (mut sender, mut receiver) = socket.split();
@@ -210,6 +247,8 @@ async fn handle_client_message(
         "chat_message" => handle_chat_message(state, &msg).await?,
         "message_ack" => handle_ack(state, &msg).await?,
         "message_recall" => handle_recall(state, &msg).await?,
+        "key_exchange" => handle_forward(state, &msg, "key_exchange").await?,
+        "key_confirm" => handle_forward(state, &msg, "key_confirm").await?,
         "ping" => {
             // 回复 Pong
             let pong = WsMessage::Pong;
@@ -220,6 +259,50 @@ async fn handle_client_message(
         _ => {
             warn!("Unknown message type: {}", msg_type);
         }
+    }
+
+    Ok(())
+}
+
+/// 转发 E2EE 协商消息（KeyExchange/KeyConfirm）到目标 peer
+///
+/// 协商消息不写入主消息缓存（避免污染聊天记录），但仍按目标 pubkey 路由：
+/// - 目标在线：直发
+/// - 目标离线：暂存在 `pending_e2ee`，目标上线时由 /sync 拉取
+async fn handle_forward(
+    state: &Arc<AppState>,
+    msg: &serde_json::Value,
+    kind: &str,
+) -> Result<(), String> {
+    let to = msg
+        .get("to")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("{} missing 'to' field", kind))?;
+    let from = msg
+        .get("from")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    info!("Forwarding {} from {} to {}", kind, from, to);
+
+    let ws_msg: WsMessage = serde_json::from_value(msg.clone())
+        .map_err(|e| format!("Invalid {} payload: {}", kind, e))?;
+
+    let clients = state.clients.read();
+    if let Some(session) = clients.get(to) {
+        if session.tx.send(ws_msg).is_err() {
+            warn!("Failed to forward {} to {}", kind, to);
+        }
+    } else {
+        // 目标离线，暂存到 pending_e2ee（短 TTL，避免长期堆积）
+        let expire_at = Utc::now().timestamp_millis() + 5 * 60 * 1000; // 5 分钟
+        state
+            .pending_e2ee
+            .write()
+            .entry(to.to_string())
+            .or_default()
+            .push((ws_msg, expire_at));
+        info!("Recipient {} offline, queued {} for later delivery", to, kind);
     }
 
     Ok(())
@@ -329,6 +412,15 @@ async fn run_keeper(state: Arc<AppState>) {
         {
             let mut cache = state.cache.write();
             cache.retain(|_, (_, expire_at)| *expire_at > now);
+        }
+
+        // 清理过期的 E2EE 暂存消息
+        {
+            let mut pending = state.pending_e2ee.write();
+            pending.retain(|_, queue| {
+                queue.retain(|(_, expire_at)| *expire_at > now);
+                !queue.is_empty()
+            });
         }
 
         // 广播 Ping 给所有客户端

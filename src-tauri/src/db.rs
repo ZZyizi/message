@@ -181,6 +181,7 @@ impl Database {
                 id TEXT PRIMARY KEY,
                 pubkey TEXT NOT NULL,
                 encrypted_private TEXT NOT NULL,
+                salt TEXT NOT NULL DEFAULT '',
                 nickname TEXT NOT NULL DEFAULT '',
                 created_at INTEGER NOT NULL
             );
@@ -211,6 +212,11 @@ impl Database {
         // 迁移：为已有的 identities 表添加 nickname 列（若已存在则忽略）
         let _ = self.conn.execute(
             "ALTER TABLE identities ADD COLUMN nickname TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        // 迁移：为已有的 identities 表添加 salt 列（若已存在则忽略）
+        let _ = self.conn.execute(
+            "ALTER TABLE identities ADD COLUMN salt TEXT NOT NULL DEFAULT ''",
             [],
         );
 
@@ -403,6 +409,18 @@ impl Database {
         Ok(deleted as i64)
     }
 
+    /// 增加 pending 消息的重试次数
+    ///
+    /// 由后台重试循环调用：每次实际重发成功后 +1，
+    /// 上层基于此实现指数退避策略。
+    pub fn increment_pending_retry(&self, event_id: &str) -> Result<(), Error> {
+        self.conn.execute(
+            "UPDATE pending_messages SET retry_count = retry_count + 1 WHERE event_id = ?1",
+            params![event_id],
+        )?;
+        Ok(())
+    }
+
     /// 插入群组记录
     pub fn insert_group(&self, group: &Group) -> Result<(), Error> {
         self.conn.execute(
@@ -479,22 +497,22 @@ impl Database {
     /// 保存身份到数据库
     ///
     /// 使用 INSERT OR REPLACE，相同 id 的记录会被更新。
-    pub fn save_identity(&self, pubkey: &str, encrypted_private: &str) -> Result<(), Error> {
+    pub fn save_identity(&self, pubkey: &str, encrypted_private: &str, salt: &str) -> Result<(), Error> {
         self.conn.execute(
-            r#"INSERT OR REPLACE INTO identities (id, pubkey, encrypted_private, nickname, created_at)
-               VALUES ('default', ?1, ?2, '', ?3)"#,
-            params![pubkey, encrypted_private, Utc::now().timestamp()],
+            r#"INSERT OR REPLACE INTO identities (id, pubkey, encrypted_private, salt, nickname, created_at)
+               VALUES ('default', ?1, ?2, ?3, '', ?4)"#,
+            params![pubkey, encrypted_private, salt, Utc::now().timestamp()],
         )?;
         Ok(())
     }
 
-    /// 从数据库加载身份
-    pub fn get_identity(&self) -> Result<Option<(String, String)>, Error> {
+    /// 从数据库加载身份（pubkey, encrypted_private, salt）
+    pub fn get_identity(&self) -> Result<Option<(String, String, String)>, Error> {
         let mut stmt = self.conn.prepare(
-            "SELECT pubkey, encrypted_private FROM identities WHERE id = 'default'"
+            "SELECT pubkey, encrypted_private, salt FROM identities WHERE id = 'default'"
         )?;
         let identity = stmt
-            .query_row([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_row([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
             .optional()?;
         Ok(identity)
     }
@@ -769,10 +787,11 @@ mod tests {
     #[test]
     fn test_identity() {
         let db = test_db();
-        db.save_identity("pub1", "enc_priv1").unwrap();
-        let (pubkey, enc_priv) = db.get_identity().unwrap().unwrap();
+        db.save_identity("pub1", "enc_priv1", "salt1").unwrap();
+        let (pubkey, enc_priv, salt) = db.get_identity().unwrap().unwrap();
         assert_eq!(pubkey, "pub1");
         assert_eq!(enc_priv, "enc_priv1");
+        assert_eq!(salt, "salt1");
     }
 
     #[test]

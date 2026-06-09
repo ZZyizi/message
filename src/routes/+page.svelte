@@ -16,6 +16,32 @@
   let sessionStatus = $state('None');
 
   onMount(async () => {
+    // 根据 dev/release 构建走不同的身份初始化流程
+    // - dev: auto_create_identity() —— dev 零密钥自动解锁
+    // - release: 若已存在身份则 unlock_identity(passphrase)；
+    //            首次启动需要 setup_identity(passphrase)（暂用 prompt 收集口令）
+    try {
+      if (import.meta.env.DEV) {
+        myPubkey = await invoke('auto_create_identity');
+      } else {
+        const alreadyUnlocked = await invoke('is_unlocked');
+        if (!alreadyUnlocked) {
+          const passphrase = window.prompt('请输入身份口令（首次启动将作为新身份的设置口令）') || '';
+          if (!passphrase) {
+            throw new Error('Passphrase is required');
+          }
+          try {
+            myPubkey = await invoke('setup_identity', { passphrase });
+          } catch (e) {
+            // 身份已存在 → 走 unlock 流程
+            myPubkey = await invoke('unlock_identity', { passphrase });
+          }
+        }
+      }
+    } catch (e) {
+      console.error('Failed to initialize identity:', e);
+    }
+
     // 获取我的公钥和昵称
     try {
       myPubkey = await invoke('get_public_key');
